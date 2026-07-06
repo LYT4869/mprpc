@@ -1,0 +1,50 @@
+#include <iostream>
+#include <string>
+#include "friend.pb.h"
+#include "mprpcapplication.h"
+#include "rpcprovider.h"
+#include "logger.h"
+// 提供本地方法Login
+// 需求：利用框架将本地方法变成rpc远程方法 
+class FriendrService : public fixbug::FriendServiceRpc //rpc提供者 ： 发布rpc方法
+{
+public:
+    std::vector<std::string> GetFriendList(uint32_t user_id){
+        std::cout <<"do GetFriendList service! userid" << user_id << std::endl;
+        std::vector<std::string> friendList = {"Li Si", "Zhao Liu"};
+        return friendList;
+    }
+
+    void GetFriendList(google::protobuf::RpcController* controller,
+                        const ::fixbug::GetFriendListRequest* request,
+                        ::fixbug::GetFriendListResponse* response,
+                        ::google::protobuf::Closure* done) override
+    {
+        uint32_t user_id = request->userid();
+
+        std::vector<std::string> friendList = GetFriendList(user_id);
+        for(int i = 0; i < friendList.size(); i++){
+            response->add_friends(friendList[i]);
+        }
+        fixbug::ResultCode *result = response->mutable_result();
+        result->set_errcode(0);
+        result->set_errmsg("");
+
+        if(done) done->Run();
+    }
+};
+
+int main(int argc, char **argv){
+    //调用框架的初始化操作 provider -i config.conf 
+    MprpcApplication::Init(argc, argv);
+
+    //provider是一个rpc网络服务对象
+    RpcProvider provider; //用于发布服务的对象
+
+    //把UserService对象发布到rpc节点上。
+    provider.NotifyService(new FriendrService());
+
+    // 启动一个rpc服务发布节点，Run以后，进程进入阻塞状态，等待远程的rpc调用请求。
+    provider.Run();
+    return 0;
+}

@@ -1,0 +1,13 @@
+{
+  "configurations": [
+    {
+      "name": "WSL",
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+      "compilerPath": "/usr/bin/g++",
+      "intelliSenseMode": "linux-gcc-x64",
+      "cStandard": "c11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}
