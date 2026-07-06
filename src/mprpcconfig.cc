@@ -22,7 +22,7 @@ void MprpcConfig::LoadConfigFile(const char *config_file){
         trim(read_buf);
 
         // 处理注释/空行
-        if(read_buf[0] == '#' || read_buf.empty()){
+        if(read_buf.empty() || read_buf[0] == '#'){
             continue;
         }
         // 解析配置项
@@ -39,6 +39,7 @@ void MprpcConfig::LoadConfigFile(const char *config_file){
         trim(value);  
         m_configMap.insert({key, value});
     }
+    fclose(pf);
 }
 //查询配置项信息
 std::string MprpcConfig::Load(const std::string &key){
