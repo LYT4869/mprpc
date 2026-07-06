@@ -2,3 +2,7 @@
 14:50:4 =>[INFO] method_name: GetFriendList
 14:52:3 =>[INFO] service_name: FriendServiceRpc
 14:52:3 =>[INFO] method_name: GetFriendList
+15:58:45 =>[INFO] service_name: FriendServiceRpc
+15:58:45 =>[INFO] method_name: GetFriendList
+16:13:32 =>[INFO] service_name: FriendServiceRpc
+16:13:32 =>[INFO] method_name: GetFriendList
