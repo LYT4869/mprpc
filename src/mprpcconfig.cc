@@ -12,11 +12,9 @@ void MprpcConfig::LoadConfigFile(const char *config_file){
 
 
     // 1. 注释 2. 正确的配置项 = 3. 去掉开头多余的空格
-    while(!feof(pf)){
-        char buf[512] = {0};
-        if(fgets(buf, 512, pf) != nullptr){
-            buf[strcspn(buf, "\n")] = '\0';
-        }
+    char buf[512] = {0};
+    while(fgets(buf, 512, pf) != nullptr){
+        buf[strcspn(buf, "\n")] = '\0';
         // 去掉字符串前面多余的空格
         std::string read_buf(buf);
         trim(read_buf);
@@ -26,18 +24,24 @@ void MprpcConfig::LoadConfigFile(const char *config_file){
             continue;
         }
         // 解析配置项
-        int idx = read_buf.find('=');
-        if(idx == -1){
+        size_t idx = read_buf.find('=');
+        if(idx == std::string::npos){
             //配置项不合法
+            std::cout << "invalid config line: " << read_buf << std::endl;
             continue;
         }
         std::string key;
         std::string value;
         key = read_buf.substr(0, idx);
         trim(key);
+        if(key.empty()){
+            //配置项不合法
+            std::cout << "invalid config line: " << read_buf << std::endl;
+            continue;
+        }
         value = read_buf.substr(idx + 1, read_buf.size() - idx);
         trim(value);  
-        m_configMap.insert({key, value});
+        m_configMap[key] = value;
     }
     fclose(pf);
 }
