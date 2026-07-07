@@ -6,3 +6,4 @@ bin/consumer
 bin/*-log.txt
 *.o
 /stuffs/
+/tmp/
