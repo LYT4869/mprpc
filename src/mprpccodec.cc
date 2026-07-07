@@ -118,6 +118,41 @@ DecodeStatus MprpcCodec::Decode(const std::string& input, MprpcFrame* frame, siz
     return DecodeStatus::OK;
 
 }
+
+std::string MprpcCodec::EncodeBody(const std::string& meta, const std::string& payload){
+    std::string body;
+    uint32_t meta_len = static_cast<uint32_t>(meta.size());
+    body.reserve(4 + meta_len + payload.size());
+    
+    AppendUint32(&body, meta_len);
+    body.append(meta);
+    body.append(payload);
+
+    return body;
+}
+DecodeStatus MprpcCodec::DecodeBody(const std::string& input, MprpcBody* decoded_body){
+    if(decoded_body == nullptr){
+        return DecodeStatus::BAD_FRAME;
+    }
+
+    if(input.size() < 4){
+        return DecodeStatus::BAD_FRAME;
+    }
+
+    const char* data = input.data();
+    uint32_t meta_len = static_cast<uint32_t>(ReadUint32(data));
+
+    if(meta_len > input.size() - 4){
+        return DecodeStatus::BAD_FRAME;
+    }
+
+    decoded_body->meta.assign(data + 4, meta_len);
+    decoded_body->payload.assign(data + 4 + meta_len, input.size() - 4 - meta_len);
+
+    return DecodeStatus::OK;
+
+}
+
 bool MprpcCodec::IsValidMessageType(uint16_t messageType){
     return messageType == static_cast<uint16_t>(MprpcMessageType::REQUEST) ||
             messageType == static_cast<uint16_t>(MprpcMessageType::RESPONSE) ||

@@ -60,12 +60,20 @@ struct MprpcFrame
     std::string body;
 };
 
+struct MprpcBody
+{
+    std::string meta;
+    std::string payload;
+};
+
 class MprpcCodec
 {
 public:
     static std::string Encode(const MprpcHeader& header, const std::string& body);
     static DecodeStatus Decode(const std::string& input, MprpcFrame* frame, size_t* bytes_consumed); 
+    static std::string EncodeBody(const std::string& meta, const std::string& payload);
+    static DecodeStatus DecodeBody(const std::string& input, MprpcBody* decoded_body);
 private:
     static bool IsValidMessageType(uint16_t message_type);
 };
-}
+} // namespace mprpc

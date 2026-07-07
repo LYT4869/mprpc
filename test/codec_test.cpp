@@ -1,7 +1,9 @@
 #include "mprpccodec.h"
+#include "proto/rpc_meta.pb.h"
 #include <cassert>
 #include <iomanip>
 #include <iostream>
+#include <string>
 
 int main(){
     mprpc::MprpcHeader header;
@@ -139,6 +141,84 @@ int main(){
 
         assert(bad_status == mprpc::DecodeStatus::FRAME_TOO_LARGE);
         assert(bad_bytes_consumed == 0);
+    }
+
+    {
+        mprpc::MprpcRequestMeta request_meta;
+        request_meta.set_service_name("FriendServiceRpc");
+        request_meta.set_method_name("GetFriendList");
+        request_meta.set_timeout_ms(3000);
+
+        std::string meta_bytes;
+        if(!request_meta.SerializeToString(&meta_bytes)){
+            std::cerr << "Failed to serialize request_meta" << std::endl;
+            return -1;
+        }
+
+        std::string user_payload = "serialized-user-payload";
+        std::string encoded_body = mprpc::MprpcCodec::EncodeBody(meta_bytes, user_payload);
+
+        mprpc::MprpcBody decoded_body;
+        mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::DecodeBody(encoded_body, &decoded_body);
+        assert(decode_status == mprpc::DecodeStatus::OK);
+        assert(decoded_body.meta == meta_bytes);
+        assert(decoded_body.payload == user_payload);
+
+        mprpc::MprpcRequestMeta parsed_meta;
+        if(!parsed_meta.ParseFromString(decoded_body.meta)){
+            std::cerr << "Failed to parse decoded meta" << std::endl;
+            return -1;
+        }
+        assert(parsed_meta.service_name() == "FriendServiceRpc");
+        assert(parsed_meta.method_name() == "GetFriendList");
+        assert(parsed_meta.timeout_ms() == 3000);
+    }
+    {
+        mprpc::MprpcRequestMeta request_meta;
+        request_meta.set_service_name("FriendServiceRpc");
+        request_meta.set_method_name("GetFriendList");
+        request_meta.set_timeout_ms(3000);
+
+        std::string meta_bytes;
+        if(!request_meta.SerializeToString(&meta_bytes)){
+            std::cerr << "Failed to serialize request_meta" << std::endl;
+            return -1;
+        }
+
+        std::string user_payload = "serialized-user-payload";
+        std::string encoded_body = mprpc::MprpcCodec::EncodeBody(meta_bytes, user_payload);
+        
+        mprpc::MprpcHeader header;
+        header.request_id = 1001;
+        header.message_type = mprpc::MprpcMessageType::REQUEST;
+        header.status_code = mprpc::MprpcErrorCode::OK;
+
+        std::string rpc_frame_bytes = mprpc::MprpcCodec::Encode(header, encoded_body);
+
+        mprpc::MprpcFrame decoded_frame;
+        size_t bytes_consumed = 0;
+        mprpc::DecodeStatus frame_decode_stats = mprpc::MprpcCodec::Decode(rpc_frame_bytes, &decoded_frame, &bytes_consumed);
+        assert(frame_decode_stats == mprpc::DecodeStatus::OK);
+        assert(bytes_consumed == rpc_frame_bytes.size());
+        assert(decoded_frame.header.request_id == 1001);
+        assert(decoded_frame.header.message_type == mprpc::MprpcMessageType::REQUEST);
+        assert(decoded_frame.header.status_code == mprpc::MprpcErrorCode::OK);
+        assert(decoded_frame.header.body_len == encoded_body.size());
+        
+        mprpc::MprpcBody decoded_body;
+        mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::DecodeBody(decoded_frame.body, &decoded_body);
+        assert(decode_status == mprpc::DecodeStatus::OK);
+        assert(decoded_body.meta == meta_bytes);
+        assert(decoded_body.payload == user_payload);
+        
+        mprpc::MprpcRequestMeta parsed_meta;
+        if(!parsed_meta.ParseFromString(decoded_body.meta)){
+            std::cerr << "Failed to parse decoded meta" << std::endl;
+            return -1;
+        }
+        assert(parsed_meta.service_name() == "FriendServiceRpc");
+        assert(parsed_meta.method_name() == "GetFriendList");
+        assert(parsed_meta.timeout_ms() == 3000);
     }
     std::cout << "codec tests passed" << std::endl;
     return 0;
