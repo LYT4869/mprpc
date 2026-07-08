@@ -1,5 +1,6 @@
 #include "mprpcchannel.h"
-#include "rpcheader.pb.h"
+#include "mprpccodec.h"
+#include "proto/rpc_meta.pb.h"
 #include "mprpcapplication.h"
 #include "mprpccontroller.h"
 #include <sys/socket.h>
@@ -25,45 +26,39 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
     std::string method_name = method->name(); // method_name
 
     // 获取参数的序列化字符串长度args_size
-    int args_size = 0;
-    std::string args_str;
-    if(request->SerializeToString(&args_str)){
-        args_size = args_str.size();
-        
-    }else{
+    std::string payload_str;
+    if(!request->SerializeToString(&payload_str)){
         controller->SetFailed("Serialize request error!");
         return;
     }
 
-    // 定义rpc请求头
-    mprpc::RpcHeader rpcHeader;
-    rpcHeader.set_service_name(service_name);
-    rpcHeader.set_method_name(method_name);
-    rpcHeader.set_args_size(args_size);
+    // 定义请求体meta
+    mprpc::MprpcRequestMeta request_meta;
+    request_meta.set_service_name(service_name);
+    request_meta.set_method_name(method_name);
+    request_meta.set_timeout_ms(0);
 
-    uint32_t header_size = 0;
-    std::string rpc_header_str;
-    if(rpcHeader.SerializeToString(&rpc_header_str)){
-        header_size = rpc_header_str.size();
-    }else{
-        controller->SetFailed("rpcHeader serialize request error!");
+    std::string meta;
+    if(!request_meta.SerializeToString(&meta)){
+        controller->SetFailed("MprpcRequestMeta serialize request error!");
         return;
     }
+    std::string body = mprpc::MprpcCodec::EncodeBody(meta, payload_str);
+    // 定义rpc请求头
+    mprpc::MprpcHeader header;
+    header.request_id = 1;
+    header.message_type = mprpc::MprpcMessageType::REQUEST;
+    header.status_code = mprpc::MprpcErrorCode::OK;
+    header.checksum = 0;
 
-    //组织待发送的rpc请求的字符串
-    std::string send_rpc_str;
-    uint32_t net_header_size = htonl(header_size);
-    send_rpc_str.insert(0, std::string(reinterpret_cast<char*>(&net_header_size), 4)); // header_size
-    send_rpc_str += rpc_header_str; //rpcheader
-    send_rpc_str += args_str; //args
+    std::string send_rpc_str = mprpc::MprpcCodec::Encode(header, body);
 
     std::cout << "==============================================" << std::endl;
-    std::cout << "header_size: " << header_size << std::endl;
-    std::cout << "rpc_header_str: " << rpc_header_str << std::endl;
     std::cout << "service_name: " << service_name << std::endl;
     std::cout << "method_name: " << method_name << std::endl;
-    std::cout << "args_size: " << args_size << std::endl;
-    std::cout << "args_str: " << args_str << std::endl;
+    std::cout << "meta_size: " << meta.size() << std::endl;
+    std::cout << "payload_size: " << payload_str.size() << std::endl;
+    std::cout << "frame_size: " << send_rpc_str.size() << std::endl;
     std::cout << "==============================================" << std::endl;
 
     // 使用tcp编程完成rpc方法的远程调用
@@ -79,7 +74,7 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
     std::string method_path = "/" + service_name + "/" + method_name;
     std::string host_data = zkCli.GetData(method_path.data());
     if(host_data == ""){
-        controller->SetFailed(method_path + "does not exist!");
+        controller->SetFailed(method_path + " does not exist!");
         return;
     }
     int idx = host_data.find(":");
@@ -140,12 +135,65 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
         response_str.append(recv_buf, n);
     }
 
+
     // 反序列化rpc调用的相应数据
-    if(!response->ParseFromString(response_str)){
-        controller->SetFailed("Response parsing error! response_str: " + response_str);
+    mprpc::MprpcFrame response_frame;
+    size_t bytes_consumed = 0;
+    mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::Decode(response_str, &response_frame, &bytes_consumed);
+
+    if(decode_status != mprpc::DecodeStatus::OK){
+        controller->SetFailed("Decode response frame error!");
         close(clientfd);
         return;
     }
+    if(bytes_consumed != response_str.size()){
+        controller->SetFailed("Unexpected extra bytes in response frame!");
+        close(clientfd);
+        return;
+    }
+    if(response_frame.header.message_type != mprpc::MprpcMessageType::RESPONSE){
+        controller->SetFailed("Response message type error!");
+        close(clientfd);
+        return;
+    }
+
+
+    mprpc::MprpcBody response_body;
+    decode_status = mprpc::MprpcCodec::DecodeBody(response_frame.body, &response_body);
+
+    if(decode_status != mprpc::DecodeStatus::OK){
+        controller->SetFailed("Decode response body error!");
+        close(clientfd);
+        return;
+    }
+
+    mprpc::MprpcResponseMeta response_meta;
+    if(!response_meta.ParseFromString(response_body.meta)){
+        controller->SetFailed("Response meta parsing error!");
+        close(clientfd);
+        return;
+    }
+    if(response_frame.header.status_code != mprpc::MprpcErrorCode::OK){
+        std::string error_msg = response_meta.error_msg();
+        if(error_msg.empty()){
+            error_msg = "RPC response status error!";
+        }
+        controller->SetFailed(error_msg);
+        close(clientfd);
+        return;
+    }
+    if(!response_meta.error_msg().empty()){
+        controller->SetFailed(response_meta.error_msg());
+        close(clientfd);
+        return;
+    }
+
+    if(!response->ParseFromString(response_body.payload)){
+        controller->SetFailed("Response payload parsing error!");
+        close(clientfd);
+        return;
+    }
+
     close(clientfd);
     if (done != nullptr) {
         done->Run();

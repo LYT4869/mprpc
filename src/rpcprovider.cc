@@ -3,7 +3,9 @@
 #include "mprpcapplication.h"
 #include <functional>
 #include <google/protobuf/descriptor.h>
-#include "rpcheader.pb.h"
+#include <memory>
+#include "proto/rpc_meta.pb.h"
+#include "mprpccodec.h"
 #include "logger.h"
 /*
 service_name => service描述；
@@ -87,89 +89,147 @@ void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn){
 在框架内部， RpcProvider和RpcConsumer协商好之间通信用的protobuf数据类型 （protobuf)
 service_name method_name args  定义proto的message类型，进行数据头的序列化和反序列化。
 
-header_size(4字节) + header_str(service_name+method_name + args_size(防止粘包问题)) + args_str;
-
 */
-void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, 
+void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
         muduo::net::Buffer *buffer, muduo::Timestamp time)
 {    
-    // 网络上接收的远程rpc调用请求的字节流 method arguments
-    std::string recv_buf = buffer->retrieveAllAsString();
+    while(buffer->readableBytes() > 0){
+        std::string input(buffer->peek(), buffer->readableBytes());
 
-    // 从字符流中读取前四个字节的内容
-    uint32_t header_size = 0;
-    recv_buf.copy((char*)&header_size, 4, 0);
-    header_size = ntohl(header_size);
-    //根据header_size读取数据头的原始字符, 反序列化数据，得到rpc请求的详细信息；
-    std::string rpc_header_str = recv_buf.substr(4, header_size);
-    mprpc::RpcHeader rpcHeader;
-    std::string service_name;
-    std::string method_name;
-    uint32_t args_size;
-    if(rpcHeader.ParseFromString(rpc_header_str)){
-        // 数据头反序列化成功；
-        service_name = rpcHeader.service_name();
-        method_name = rpcHeader.method_name();
-        args_size = rpcHeader.args_size();
-    }else{
-        // 数据头反序列化失败；
-        std::cout << "rpc_header_str: " << rpc_header_str << " parse error!" << std::endl;
+        mprpc::MprpcFrame rpc_frame;
+        size_t bytes_consumed = 0;
+        mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::Decode(input, &rpc_frame, &bytes_consumed);  
+        if(decode_status == mprpc::DecodeStatus::OK){
+            buffer->retrieve(bytes_consumed);
+            HandleRpcFrame(conn, rpc_frame);
+            continue;
+        }
+
+        if(decode_status == mprpc::DecodeStatus::NEED_MORE_DATA) break;
+
+        std::cout << "Decode rpc frame error" << std::endl;
+        conn->shutdown();
+        break;
+    }
+}
+
+//closure回调操作，用于序列化rpc的响应和网络发送。
+void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponseContext* context){
+    std::string response_payload;
+    // response进行序列化
+    if(!context->response->SerializeToString(&response_payload)){
+        std::cout <<"Serialize response_str error!" << std::endl;
+        conn->shutdown();
         return;
     }
-    // 获取rpc方法参数的字符流数据
-    std::string args_str = recv_buf.substr(4+header_size, args_size);
-    // 打印调试信息
+
+    mprpc::MprpcResponseMeta response_meta;
+    response_meta.set_error_msg("");
+    std::string meta;
+    if(!response_meta.SerializeToString(&meta)){
+        std::cout <<"Serialize response_str error!" << std::endl;
+        conn->shutdown();
+        return;
+    }
+
+    std::string body = mprpc::MprpcCodec::EncodeBody(meta, response_payload);
+
+    mprpc::MprpcHeader header;
+    header.request_id = context->request_id;
+    header.message_type = mprpc::MprpcMessageType::RESPONSE;
+    header.status_code = mprpc::MprpcErrorCode::OK;
+    header.checksum = 0;
+
+    std::string frame = mprpc::MprpcCodec::Encode(header, body);
+
+    conn->send(frame);
+    conn->shutdown(); // 模拟http的短链接服务，由rpcprovider主动断开连接。
+    delete context->response;
+    delete context;
+}
+
+void RpcProvider::SendRpcErrorResponse(const muduo::net::TcpConnectionPtr& conn, uint64_t request_id, mprpc::MprpcErrorCode error_code, const std::string& err_msg){
+    mprpc::MprpcResponseMeta meta_response;
+    meta_response.set_error_msg(err_msg);
+    std::string meta;
+    if(!meta_response.SerializeToString(&meta)){
+        std::cout << "Serialize error response meta failed!" << std::endl;
+        conn->shutdown();
+        return;
+    }
+
+    std::string body = mprpc::MprpcCodec::EncodeBody(meta, "");
+    
+    mprpc::MprpcHeader header;
+    header.request_id = request_id;
+    header.status_code = error_code;
+    header.message_type = mprpc::MprpcMessageType::RESPONSE;
+    header.checksum = 0;
+
+    std::string frame = mprpc::MprpcCodec::Encode(header, body);
+    conn->send(frame);
+    conn->shutdown();
+}
+
+void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const mprpc::MprpcFrame& frame){
+
+    mprpc::MprpcBody rpc_body;
+    mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::DecodeBody(frame.body, &rpc_body);
+    if(decode_status != mprpc::DecodeStatus::OK){
+        SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::BAD_FRAME, "Decode rpc body error!");
+        return;
+    }
+
+    mprpc::MprpcRequestMeta rpc_meta;
+    if(!rpc_meta.ParseFromString(rpc_body.meta)){
+        SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::PARSE_ERROR, "Parse rpc meta error!");
+        return;
+    }
+
+    const std::string& service_name = rpc_meta.service_name();
+    const std::string& method_name = rpc_meta.method_name();
+    const uint32_t timeout_ms = rpc_meta.timeout_ms();
+    const std::string& payload = rpc_body.payload;
+
     std::cout << "==============================================" << std::endl;
-    std::cout << "header_size: " << header_size << std::endl;
-    std::cout << "rpc_header_str: " << rpc_header_str << std::endl;
     std::cout << "service_name: " << service_name << std::endl;
     std::cout << "method_name: " << method_name << std::endl;
-    std::cout << "args_size: " << args_size << std::endl;
-    std::cout << "args_str: " << args_str << std::endl;
+    std::cout << "timeout_ms: " << timeout_ms << std::endl;
+    std::cout << "payload_size: " << payload.size() << std::endl;
     std::cout << "==============================================" << std::endl;
 
-    //获取service对象和method对象
     auto it = m_serviceMap.find(service_name);
     if(it == m_serviceMap.end()){
-        std::cout << service_name << " does not exist!" << std::endl;
+        SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::SERVICE_NOT_FOUND, service_name + " does not exist!");
         return;
     }
 
     auto mit = it->second.m_methodMap.find(method_name);
     if(mit == it->second.m_methodMap.end()){
-        std::cout << method_name << " does not exist!" << std::endl;
+        SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::METHOD_NOT_FOUND, method_name + " does not exist!");
         return;
     }
 
-    google::protobuf::Service *service = it->second.m_service; //获取service对象 
-    const google::protobuf::MethodDescriptor* method = mit->second; //获取method对象
+    google::protobuf::Service *service = it->second.m_service;
+    const google::protobuf::MethodDescriptor *method = mit->second;
+
+    std::unique_ptr<google::protobuf::Message> request(service->GetRequestPrototype(method).New());
     
-    // 生成rpc方法调用的请求request和响应response参数
-    google::protobuf::Message *request = service->GetRequestPrototype(method).New();
+    
+    if(!request->ParseFromString(payload)){
+        SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::PARSE_ERROR, "Parse request payload error!");
+        return;
+    }
+
     google::protobuf::Message *response = service->GetResponsePrototype(method).New();
-    
-    if(!request->ParseFromString(args_str)){
-        std::cout << "request parse error! content: " << args_str << std::endl;
-        return;
-    }
-
-    // 给method方法调用绑定Closure回调函数
-    google::protobuf::Closure* done = google::protobuf::NewCallback<RpcProvider,const muduo::net::TcpConnectionPtr&, google::protobuf::Message*>(this, &RpcProvider::SendRpcResponse, conn, response);
-    //在框架上根据远端rpc请求，调用当前rpc节点方法
-    service->CallMethod(method, nullptr, request, response, done);
-}
-
-//closure回调操作，用于序列化rpc的响应和网络发送。
-void RpcProvider::SendRpcResponse(const muduo::net::TcpConnectionPtr &conn, google::protobuf::Message* response){
-    std::string response_str;
-
-    // response进行序列化
-    if(response->SerializeToString(&response_str)){
-        //序列化成功后，通过网络把rpc方法执行的结果发送回rpc的调用方
-        conn->send(response_str);
-    }
-    else{
-        std::cout <<"Serialize response_str error!" << std::endl;
-    }
-    conn->shutdown(); // 模拟http的短链接服务，由rpcprovider主动断开连接。
-}
+    RpcResponseContext* response_context = new RpcResponseContext{response, frame.header.request_id};
+    google::protobuf::Closure* done = google::protobuf::NewCallback<RpcProvider, 
+                                                                    muduo::net::TcpConnectionPtr,
+                                                                    RpcResponseContext*>(
+                                                                        this,
+                                                                        &RpcProvider::SendRpcResponse, 
+                                                                        conn, 
+                                                                        response_context
+                                                                    );
+    service->CallMethod(method, nullptr, request.get(), response, done);
+} 
