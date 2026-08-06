@@ -7,3 +7,4 @@ bin/*-log.txt
 *.o
 /stuffs/
 /tmp/
+*-log.txt

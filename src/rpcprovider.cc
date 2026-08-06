@@ -145,7 +145,7 @@ void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponse
     std::string frame = mprpc::MprpcCodec::Encode(header, body);
 
     conn->send(frame);
-    conn->shutdown(); // 模拟http的短链接服务，由rpcprovider主动断开连接。
+
     delete context;
 }
 
@@ -169,7 +169,6 @@ void RpcProvider::SendRpcErrorResponse(const muduo::net::TcpConnectionPtr& conn,
 
     std::string frame = mprpc::MprpcCodec::Encode(header, body);
     conn->send(frame);
-    conn->shutdown();
 }
 
 void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const mprpc::MprpcFrame& frame){

@@ -1,41 +1,9 @@
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <errno.h>
-#include <unistd.h>
-#include <cstring>
 #include <charconv>
 #include <muduo/net/InetAddress.h>
 
 #include "zookeeperutil.h"
 #include "channelcore.h"
 #include "proto/rpc_meta.pb.h"
-
-namespace
-{
-class ScopedFd
-{
-public:
-    explicit ScopedFd(int fd = -1) : fd_(fd) {}
-    ~ScopedFd(){
-        if(fd_ != -1){
-            close(fd_);
-        }
-    }
-    
-    int get() const{
-        return fd_;
-    }
-
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-
-private:
-    int fd_;
-};
-} // namespace
 
 ChannelCore::ChannelCore() : loop_(io_thread_.startLoop()){}
 
@@ -49,6 +17,8 @@ RpcCallResult ChannelCore::StartCall(const std::string& service_name,
 
     uint64_t request_id = next_request_id_.fetch_add(1);
     state->request_id = request_id;
+    call_result.request_id = request_id;
+
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_calls_[request_id] = state;
@@ -75,24 +45,33 @@ RpcCallResult ChannelCore::StartCall(const std::string& service_name,
         return state->result;
     }
     // 发送rpc请求)
-    std::string response_frame;
-    status_code = DoSyncRequest(endpoint, request_frame, options.timeout_ms, &response_frame, &error_msg);
-    if(status_code != mprpc::MprpcErrorCode::OK){
-        call_result.status_code = status_code;
-        call_result.error_msg = std::move(error_msg);
-        CompleteCall(request_id, std::move(call_result));
-        return state->result;
+    if(options.timeout_ms != 0){
+        std::weak_ptr<ChannelCore> weak_self = shared_from_this();
+
+        double timeout_seconds = static_cast<double>(options.timeout_ms) / 1000.0;
+
+        loop_->runAfter(
+            timeout_seconds,
+            [weak_self, request_id](){
+                if(auto self = weak_self.lock()){
+                    RpcCallResult timeout_result;
+                    timeout_result.request_id = request_id;
+                    timeout_result.status_code = mprpc::MprpcErrorCode::TIMEOUT;
+                    timeout_result.error_msg = "RPC call timeout!";
+
+                    self->CompleteCall(request_id, std::move(timeout_result));
+                }
+            });
     }
 
-    // // 解析响应帧
-    // if(!ParseResponseFrame(response_frame, &call_result, &error_msg)){
-    //     call_result.status_code = mprpc::MprpcErrorCode::DECODE_FAILED;
-    //     call_result.error_msg = std::move(error_msg);
-    //     CompleteCall(request_id, std::move(call_result));
-    //     return state->result;
-    // }
+    SendFrame(endpoint, std::move(request_frame));
 
-    // CompleteCall(request_id, std::move(call_result));
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv.wait(
+        lock,
+        [&state](){
+            return state->completed;
+        });
     return state->result;
 }
 
@@ -148,7 +127,7 @@ void ChannelCore::SendFrameInLoop(Endpoint endpoint, std::string frame)
     loop_->assertInLoopThread();
 
     ClientSession* session = GetOrCreateSession(endpoint);
-    auto conn =session->client->connection();
+    auto conn = session->client->connection();
 
     if(conn && conn->connected()){
         conn->send(frame);
@@ -292,7 +271,7 @@ RpcCallResult ChannelCore::ParseResponseFrame(const mprpc::MprpcFrame& response_
         result.error_msg = "Response message type error!";
         return result;
     }
-    
+
     // 反序列化rpc调用的相应数据
     mprpc::MprpcBody response_body;
     mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::DecodeBody(response_frame.body, &response_body);
@@ -365,84 +344,5 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
 
     endpoint->ip = ip;
     endpoint->port = static_cast<uint16_t>(port);
-    return mprpc::MprpcErrorCode::OK;
-}
-mprpc::MprpcErrorCode ChannelCore::DoSyncRequest(
-                        const Endpoint& endpoint,
-                        const std::string& request_frame,
-                        uint32_t timeout_ms,
-                        std::string* response_frame,
-                        std::string* error_msg)
-{
-    // 使用tcp编程完成rpc方法的远程调用
-    ScopedFd clientfd(socket(AF_INET, SOCK_STREAM, 0));
-    if(clientfd.get() == -1){
-        *error_msg = "Create socket error! errno: " + std::to_string(errno);
-        return mprpc::MprpcErrorCode::NETWORK_ERROR;
-    }
-
-    struct sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(endpoint.port);
-    server_addr.sin_addr.s_addr = inet_addr(endpoint.ip.c_str());
-    
-    // 连接rpc服务节点
-    if(connect(clientfd.get(), (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1){
-        *error_msg = "Connection error! errno: " + std::to_string(errno);
-        return mprpc::MprpcErrorCode::NETWORK_ERROR;
-    }
-
-
-    if(timeout_ms != 0){
-        timeval timeout{};
-        timeout.tv_sec = timeout_ms / 1000;
-        timeout.tv_usec = (timeout_ms % 1000) * 1000;
-        if(setsockopt(clientfd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1){
-            *error_msg = "Set recv timeout error! errno: " + std::to_string(errno);
-            return mprpc::MprpcErrorCode::NETWORK_ERROR;
-        }
-    }
-
-    size_t total_sent = 0;
-    while(total_sent < request_frame.size()){
-        ssize_t n = send(clientfd.get(), request_frame.data() + total_sent, request_frame.size() - total_sent, 0);
-        if(n == -1){
-            if(errno == EINTR){
-                continue;
-            }
-            *error_msg = "Send error! errno: " + std::to_string(errno);
-            return mprpc::MprpcErrorCode::NETWORK_ERROR;
-        }
-        if (n == 0) {
-            *error_msg = "Send returned 0, connection may be closed.";
-            return mprpc::MprpcErrorCode::NETWORK_ERROR;
-        }
-        total_sent += static_cast<size_t>(n);
-    }
-
-    
-    // 接收rpc请求的响应值
-    char recv_buf[1024];
-
-    while(true){
-        ssize_t n = recv(clientfd.get(), recv_buf, sizeof(recv_buf), 0);
-
-        if (n == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if(errno == EAGAIN || errno == EWOULDBLOCK){
-                *error_msg = "RPC timeout";
-                return mprpc::MprpcErrorCode::TIMEOUT;
-            }
-            *error_msg = "Recv error! errno: " + std::to_string(errno);
-            return mprpc::MprpcErrorCode::NETWORK_ERROR;
-        }
-        if (n == 0) {
-            // 对端关闭连接，说明响应接收完毕
-            break;
-        }
-        response_frame->append(recv_buf, n);
-    }
     return mprpc::MprpcErrorCode::OK;
 }

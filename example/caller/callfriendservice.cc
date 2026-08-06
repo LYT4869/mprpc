@@ -10,26 +10,26 @@ int main(int argc, char **argv){
     // 演示调用远程发布的rpc方法Login
     fixbug::FriendServiceRpc_Stub stub(new MprpcChannel());
     // rpc方法的请求参数
-    fixbug::GetFriendListRequest request;
-    request.set_userid(1234);
-    fixbug::GetFriendListResponse response;
+    for(int i = 0; i < 2; i++){
+        fixbug::GetFriendListRequest request;
+        request.set_userid(1234);
+        fixbug::GetFriendListResponse response;
 
-    MprpcController controller;
-    stub.GetFriendList(&controller, &request, &response, nullptr);
-    std::vector<std::string> friendList;
-    if(!controller.Failed()){
-        if(0 == response.result().errcode()){
-            std::cout << "rpc register response success!"<< std::endl;
-            int size = response.friends_size();
-            for(int i = 0; i < size; i++){
-                std::cout << "index: " << (i + 1) << " name:" << response.friends(i) << std::endl;
-            }
+        MprpcController controller;
+        stub.GetFriendList(&controller, &request, &response, nullptr);
+        std::vector<std::string> friendList;
+        if(controller.Failed()){
+            std::cout << "call" << i 
+                    <<" failed: "
+                    << controller.ErrorText()
+                    << std::endl;
+            continue;    
         }
-        else{
-            std::cout << "rpc register response error : " << response.result().errmsg() << std::endl;
-        }
-    }else{
-        std::cout <<"rpc connection failed! Error info: " << controller.ErrorText() << std::endl;
+
+        std::cout << "call " << i
+                << " sucess, friends: "
+                << response.friends_size()
+                << std::endl;
     }
     return 0;
 }

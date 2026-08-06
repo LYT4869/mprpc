@@ -117,14 +117,5 @@ private:
     mprpc::MprpcErrorCode GetEndpoint(const std::string& service_name,
                         const std::string& method_name,
                         Endpoint* endpoint,
-                        std::string* error_msg); 
-    
-    mprpc::MprpcErrorCode DoSyncRequest(
-                        const Endpoint& endpoint,
-                        const std::string& request_frame,
-                        uint32_t timeout_ms,
-                        std::string* response_frame,
-                        std::string* error_msg);
-
-    
+                        std::string* error_msg);     
 };
