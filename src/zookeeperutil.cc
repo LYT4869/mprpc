@@ -69,11 +69,13 @@ void ZkClient::Create(const char *path, const char *data, int datalen, int state
     }
 }
 std::string ZkClient::GetData(const char *path){
-    char buffer[64];
+    char buffer[256];
     int bufferlen = sizeof(buffer);
+
     int flag = zoo_get(m_zhandle, path, 0, buffer, &bufferlen, nullptr);
+
     if(flag == ZOK){
-        return std::string(buffer);
+        return std::string(buffer, bufferlen);
     }
     else{
         std::cout << "get znode error.... path: " << path << std::endl;

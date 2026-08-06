@@ -67,9 +67,9 @@ void RpcProvider::Run(){
         for(auto &mp: sp.second.m_methodMap){
             // /service_name/method_name
             std::string method_path = service_path + "/" + mp.first;
-            char method_path_data[129] = {0};
-            sprintf(method_path_data,  "%s:%d", ip.data(), port);
-            zkCli.Create(method_path.data(), method_path_data, sizeof(method_path_data), ZOO_EPHEMERAL);
+            // ip + port
+            std::string endpoint = ip + ":" + std::to_string(port);
+            zkCli.Create(method_path.data(), endpoint.data(), static_cast<int>(endpoint.size()), ZOO_EPHEMERAL);
         }
     }
     std::cout << "[RpcProvider] start service at ip: " << ip << " port: " << port << std::endl;
@@ -120,6 +120,7 @@ void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponse
     if(!context->response->SerializeToString(&response_payload)){
         std::cout <<"Serialize response_str error!" << std::endl;
         conn->shutdown();
+        delete context;
         return;
     }
 
@@ -129,6 +130,7 @@ void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponse
     if(!response_meta.SerializeToString(&meta)){
         std::cout <<"Serialize response_str error!" << std::endl;
         conn->shutdown();
+        delete context;
         return;
     }
 
@@ -144,7 +146,6 @@ void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponse
 
     conn->send(frame);
     conn->shutdown(); // 模拟http的短链接服务，由rpcprovider主动断开连接。
-    delete context->response;
     delete context;
 }
 
@@ -159,7 +160,7 @@ void RpcProvider::SendRpcErrorResponse(const muduo::net::TcpConnectionPtr& conn,
     }
 
     std::string body = mprpc::MprpcCodec::EncodeBody(meta, "");
-    
+
     mprpc::MprpcHeader header;
     header.request_id = request_id;
     header.status_code = error_code;
@@ -221,8 +222,11 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
         return;
     }
 
-    google::protobuf::Message *response = service->GetResponsePrototype(method).New();
-    RpcResponseContext* response_context = new RpcResponseContext{response, frame.header.request_id};
+    auto response = std::unique_ptr<google::protobuf::Message>(service->GetResponsePrototype(method).New());
+
+    google::protobuf::Message* response_raw = response.get();
+
+    RpcResponseContext* response_context = new RpcResponseContext{std::move(response), frame.header.request_id};
     google::protobuf::Closure* done = google::protobuf::NewCallback<RpcProvider, 
                                                                     muduo::net::TcpConnectionPtr,
                                                                     RpcResponseContext*>(
@@ -231,5 +235,5 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
                                                                         conn, 
                                                                         response_context
                                                                     );
-    service->CallMethod(method, nullptr, request.get(), response, done);
+    service->CallMethod(method, nullptr, request.get(), response_raw, done);
 } 

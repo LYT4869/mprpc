@@ -17,19 +17,33 @@ enum class MprpcMessageType : uint16_t
     HEARTBEAT = 3,
 };
 
-enum class MprpcErrorCode : uint16_t 
+enum class MprpcErrorCode : uint16_t
 {
     OK = 0,
+
+    // codec / frame errors
     INVALID_MAGIC = 1001,
     INVALID_VERSION = 1002,
     FRAME_TOO_LARGE = 1003,
     BAD_FRAME = 1004,
     CHECKSUM_MISMATCH = 1005,
-    PARSE_ERROR = 1006,
-    SERVICE_NOT_FOUND = 1007,
-    METHOD_NOT_FOUND = 1008,
-    TIMEOUT = 1009,
-    INTERNAL_ERROR = 1010,
+    DECODE_FAILED = 1006,
+
+    // protobuf / parse errors
+    PARSE_ERROR = 1101,
+    SERIALIZE_FAILED = 1102,
+
+    // service dispatch errors
+    SERVICE_NOT_FOUND = 1201,
+    METHOD_NOT_FOUND = 1202,
+
+    // transport / client errors
+    TIMEOUT = 1301,
+    NETWORK_ERROR = 1302,
+    INVALID_ADDRESS = 1303,
+
+    // generic framework errors
+    INTERNAL_ERROR = 1401,
 };
 
 enum class DecodeStatus

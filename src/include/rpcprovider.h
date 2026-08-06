@@ -35,7 +35,7 @@ private:
     std::unordered_map<std::string, ServiceInfo> m_serviceMap;
     struct RpcResponseContext
     {
-        google::protobuf::Message *response;
+        std::unique_ptr<google::protobuf::Message> response;
         uint64_t request_id;
     };
     //新的socket连接回调；
