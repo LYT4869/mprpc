@@ -17,8 +17,13 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
 
     // 获取参数的序列化字符串长度args_size
     std::string request_payload;
-    if(!request->SerializeToString(&request_payload)){
-        controller->SetFailed("Serialize request error!");
+    if(request == nullptr || !request->SerializeToString(&request_payload)){
+        if(controller != nullptr){
+            controller->SetFailed("Serialize request failed!");
+        }
+        if(done != nullptr){
+            done->Run();
+        }
         return;
     }
 
@@ -34,17 +39,45 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
     std::cout << "timeout_ms: " << options.timeout_ms << std::endl;
     std::cout << "==============================================" << std::endl;
 
-    RpcCallResult result = core_->StartCall(service_name, method_name, request_payload, options);
+    if(done == nullptr){
+        // 同步调用
 
+        CallHandle call = core_->StartCall(service_name, method_name, request_payload, options, {});
+        RpcCallResult  result = core_->WaitCall(call);
+
+        FinishProtobufCall(controller, response, nullptr, result);
+        return;
+    }else{
+        // 异步调用
+        RpcCompletion completion = [controller, response, done](const RpcCallResult& result){
+            FinishProtobufCall(controller, response, done, result);
+        };
+        core_->StartCall(service_name, method_name, request_payload, options, std::move(completion));
+    }
+}
+
+void MprpcChannel::FinishProtobufCall(
+    google::protobuf::RpcController* controller,
+    google::protobuf::Message* response,
+    google::protobuf::Closure* done,
+    const RpcCallResult& result
+)
+{
     if(!result.Ok()){
-        controller->SetFailed(result.error_msg);
-        return;
+        if(controller != nullptr){
+            std::string error_msg = result.error_msg.empty() ? "RPC call failed" : result.error_msg;
+            controller->SetFailed(error_msg);
+        }
+    }else if(response == nullptr){
+        if(controller != nullptr){
+            controller->SetFailed("RPC response object is null!");
+        }
+    }else if(!response->ParseFromString(result.response_payload)){
+        if(controller != nullptr){
+            controller->SetFailed("Response payload parsing error!");
+        }
     }
 
-    if(!response->ParseFromString(result.response_payload)){
-        controller->SetFailed("Response payload parsing error!");
-        return;
-    }
     if (done != nullptr) {
         done->Run();
     }

@@ -7,13 +7,15 @@
 
 ChannelCore::ChannelCore() : loop_(io_thread_.startLoop()){}
 
-RpcCallResult ChannelCore::StartCall(const std::string& service_name,
+CallHandle ChannelCore::StartCall(const std::string& service_name,
                 const std::string& method_name,
                 const std::string& request_payload,
-                const CallOptions& options)
+                const CallOptions& options,
+                RpcCompletion completion)
 {
     RpcCallResult call_result;
     auto state = std::make_shared<CallState>();
+    state->completion = std::move(completion);
 
     uint64_t request_id = next_request_id_.fetch_add(1);
     state->request_id = request_id;
@@ -32,7 +34,7 @@ RpcCallResult ChannelCore::StartCall(const std::string& service_name,
         call_result.status_code = mprpc::MprpcErrorCode::SERIALIZE_FAILED;
         call_result.error_msg = std::move(error_msg);
         CompleteCall(request_id, std::move(call_result));
-        return state->result;
+        return state;
     }
 
     Endpoint endpoint;
@@ -42,7 +44,7 @@ RpcCallResult ChannelCore::StartCall(const std::string& service_name,
         call_result.status_code =status_code;
         call_result.error_msg = std::move(error_msg);
         CompleteCall(request_id, std::move(call_result));
-        return state->result;
+        return state;
     }
     // 发送rpc请求)
     if(options.timeout_ms != 0){
@@ -66,15 +68,25 @@ RpcCallResult ChannelCore::StartCall(const std::string& service_name,
 
     SendFrame(endpoint, std::move(request_frame));
 
+    return state;
+}
+RpcCallResult ChannelCore::WaitCall(const CallHandle& state){
+    if(!state){
+        RpcCallResult result;
+        result.status_code = mprpc::MprpcErrorCode::INTERNAL_ERROR;
+        result.error_msg = "Invalid call state!";
+        return result;
+    }
+
     std::unique_lock<std::mutex> lock(state->mutex);
     state->cv.wait(
         lock,
         [&state](){
             return state->completed;
-        });
+        }
+    );
     return state->result;
 }
-
 bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
 {
     std::shared_ptr<CallState> state;

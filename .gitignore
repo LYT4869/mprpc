@@ -8,3 +8,5 @@ bin/*-log.txt
 /stuffs/
 /tmp/
 *-log.txt
+/bin/*
+!/bin/test.conf

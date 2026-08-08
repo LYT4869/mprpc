@@ -4,6 +4,9 @@
 #include "mprpcapplication.h"
 #include "rpcprovider.h"
 #include "logger.h"
+#include <chrono>
+#include <thread>
+
 // 提供本地方法Login
 // 需求：利用框架将本地方法变成rpc远程方法 
 class FriendrService : public fixbug::FriendServiceRpc //rpc提供者 ： 发布rpc方法
@@ -22,6 +25,33 @@ public:
     {
         uint32_t user_id = request->userid();
 
+        if(user_id == 9999) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(1)
+            );
+        }
+        if(user_id >= 10000 &&
+            user_id < 10010) {
+                int delay_ms = (10009 - user_id) * 50;
+                std::thread(
+                    [user_id, response, done, delay_ms]{
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(delay_ms)
+                        );
+
+                        response->add_friends("user-" + std::to_string(user_id));
+
+                        fixbug::ResultCode *result = response->mutable_result();
+                        result->set_errcode(0);
+                        result->set_errmsg("");
+
+                        if (done != nullptr) {
+                            done->Run();
+                        }
+                    })
+                    .detach();
+                return;
+            }
         std::vector<std::string> friendList = GetFriendList(user_id);
         for(int i = 0; i < friendList.size(); i++){
             response->add_friends(friendList[i]);

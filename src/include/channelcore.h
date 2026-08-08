@@ -30,6 +30,7 @@ struct RpcCallResult
         return status_code == mprpc::MprpcErrorCode::OK && error_msg.empty();
     }
 };
+using RpcCompletion = std::function<void(const RpcCallResult&)>;
 
 struct CallOptions
 {
@@ -43,6 +44,7 @@ enum class CallPhase
     Completed
 };
 
+
 struct CallState
 {
     uint64_t request_id = 0;
@@ -53,19 +55,21 @@ struct CallState
     std::condition_variable cv;
     bool completed = false;
 
-    std::function<void(const RpcCallResult&)> completion;
+    RpcCompletion completion;
     
 };
 
+using CallHandle = std::shared_ptr<CallState>;
 class ChannelCore : public std::enable_shared_from_this<ChannelCore>
 {
 public:
     ChannelCore();
-    RpcCallResult StartCall(const std::string& service_name,
+    CallHandle StartCall(const std::string& service_name,
                    const std::string& method_name,
                    const std::string& request_payload,
-                   const CallOptions& options);
-
+                   const CallOptions& options,
+                   RpcCompletion completion = {});
+    RpcCallResult WaitCall(const CallHandle& state);
 
 private:
     struct ClientSession
