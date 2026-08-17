@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(mprpc)
+include(CTest)
+find_package(Protobuf REQUIRED)
+find_package(ZLIB REQUIRED)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_BUILD_TYPE "Debug")
@@ -18,6 +21,7 @@ link_directories(${PROJECT_SOURCE_DIR}/lib)
 
 # src包含了mprpc框架所有的相关代码
 add_subdirectory(src)
+add_subdirectory(extensions/file_transfer)
 # example包含了mprpc框架使用的示例代码
 add_subdirectory(example)
 

@@ -58,18 +58,26 @@ void RpcProvider::Run(){
     // 把当前rpc节点上要发布的服务全部注册到zk上面，让rpc client可以从zk上发现服务
     // session timeout 30s   zkclient API 网络IO线程 1/3 * timeout 时间发送ping消息（心跳消息）   
     ZkClient zkCli;
-    zkCli.Start();
-    // service_name为永久性节点 method_name为临时性节点
+    if (!zkCli.Start()) {
+        std::cerr << "failed to connect to ZooKeeper" << std::endl;
+        return;
+    }
+    const std::string endpoint = ip + ":" + std::to_string(port);
     for(auto &sp : m_serviceMap){
-        // /service_name
         std::string service_path = "/" + sp.first;
         zkCli.Create(service_path.data(), nullptr,0, 0);
         for(auto &mp: sp.second.m_methodMap){
-            // /service_name/method_name
             std::string method_path = service_path + "/" + mp.first;
-            // ip + port
-            std::string endpoint = ip + ":" + std::to_string(port);
-            zkCli.Create(method_path.data(), endpoint.data(), static_cast<int>(endpoint.size()), ZOO_EPHEMERAL);
+            zkCli.Create(method_path.data(), nullptr, 0, 0);
+            std::string providers_path = method_path + "/providers";
+            zkCli.Create(providers_path.data(), nullptr, 0, 0);
+            const std::string provider_path =
+                zkCli.CreateEphemeralSequential(
+                    providers_path + "/provider-", endpoint);
+            if (provider_path.empty()) {
+                std::cerr << "failed to register " << method_path << std::endl;
+                return;
+            }
         }
     }
     std::cout << "[RpcProvider] start service at ip: " << ip << " port: " << port << std::endl;
@@ -191,12 +199,7 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
     const uint32_t timeout_ms = rpc_meta.timeout_ms();
     const std::string& payload = rpc_body.payload;
 
-    std::cout << "==============================================" << std::endl;
-    std::cout << "service_name: " << service_name << std::endl;
-    std::cout << "method_name: " << method_name << std::endl;
-    std::cout << "timeout_ms: " << timeout_ms << std::endl;
-    std::cout << "payload_size: " << payload.size() << std::endl;
-    std::cout << "==============================================" << std::endl;
+    (void)timeout_ms;
 
     auto it = m_serviceMap.find(service_name);
     if(it == m_serviceMap.end()){
@@ -235,4 +238,4 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
                                                                         response_context
                                                                     );
     service->CallMethod(method, nullptr, request.get(), response_raw, done);
-} 
+}

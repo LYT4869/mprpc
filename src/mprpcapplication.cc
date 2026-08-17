@@ -1,6 +1,5 @@
 #include "mprpcapplication.h"
 #include <iostream>
-#include <unistd.h>
 #include <string>
 
 MprpcConfig MprpcApplication::m_config;
@@ -14,23 +13,20 @@ void MprpcApplication::Init(int argc, char **argv){
         exit(EXIT_FAILURE);
     }
 
-    int c = 0;
     std::string config_file;
-    while((c = getopt(argc, argv, "i:")) != -1)
-    {
-        switch(c){
-            case 'i':
-                config_file = optarg;
-                break;
-            case '?':
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "-i") {
+            if (i + 1 >= argc) {
                 ShowArgsHelp();
                 exit(EXIT_FAILURE);
-            case ':':
-                ShowArgsHelp();
-                exit(EXIT_FAILURE);
-            default:
-                break;
+            }
+            config_file = argv[++i];
         }
+    }
+
+    if (config_file.empty()) {
+        ShowArgsHelp();
+        exit(EXIT_FAILURE);
     }
 
     // 加载配置文件
@@ -45,4 +41,3 @@ MprpcApplication& MprpcApplication::GetInstance(){
 MprpcConfig& MprpcApplication::GetConfig(){
     return m_config;
 }
- 

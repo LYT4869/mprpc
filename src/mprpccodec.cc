@@ -1,5 +1,7 @@
 #include "mprpccodec.h"
 
+#include <zlib.h>
+
 namespace mprpc
 {
 namespace
@@ -40,6 +42,25 @@ namespace
         }
         return value;
     }
+    void WriteUint32(std::string* output, std::size_t offset,
+                     uint32_t value){
+        (*output)[offset] = static_cast<char>((value >> 24) & 0xFF);
+        (*output)[offset + 1] = static_cast<char>((value >> 16) & 0xFF);
+        (*output)[offset + 2] = static_cast<char>((value >> 8) & 0xFF);
+        (*output)[offset + 3] = static_cast<char>(value & 0xFF);
+    }
+    uint32_t ComputeFrameChecksum(const char* data, uint32_t body_len){
+        static constexpr unsigned char zeros[4] = {0, 0, 0, 0};
+        uLong checksum = ::crc32(0L, Z_NULL, 0);
+        checksum = ::crc32(checksum,
+                           reinterpret_cast<const Bytef*>(data), 24);
+        checksum = ::crc32(checksum, zeros, 4);
+        checksum = ::crc32(
+            checksum,
+            reinterpret_cast<const Bytef*>(data + MPRPC_HEADER_SIZE),
+            body_len);
+        return static_cast<uint32_t>(checksum);
+    }
 } // namespace
 
 std::string MprpcCodec::Encode(const MprpcHeader& header, const std::string& body){
@@ -63,9 +84,13 @@ std::string MprpcCodec::Encode(const MprpcHeader& header, const std::string& bod
     AppendUint64(&output, encode_header.request_id);
     AppendUint16(&output, static_cast<uint16_t>(encode_header.message_type));
     AppendUint16(&output, static_cast<uint16_t>(encode_header.status_code));
-    AppendUint32(&output, encode_header.checksum);
+    AppendUint32(&output, 0);
 
     output.append(body);
+
+    encode_header.checksum = ComputeFrameChecksum(
+        output.data(), encode_header.body_len);
+    WriteUint32(&output, 24, encode_header.checksum);
 
     return output;
 }
@@ -109,6 +134,10 @@ DecodeStatus MprpcCodec::Decode(const std::string& input, MprpcFrame* frame, siz
     size_t frame_size = MPRPC_HEADER_SIZE + header.body_len;
     if(input.size() < frame_size){
         return DecodeStatus::NEED_MORE_DATA;
+    }
+
+    if (ComputeFrameChecksum(data, header.body_len) != header.checksum) {
+        return DecodeStatus::CHECKSUM_MISMATCH;
     }
 
     frame->header = header;

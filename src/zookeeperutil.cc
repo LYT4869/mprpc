@@ -1,85 +1,171 @@
 #include "zookeeperutil.h"
+
 #include "mprpcapplication.h"
-#include <semaphore.h>
+
+#include <chrono>
 #include <iostream>
-#include <string>
 
-// 全局watcher观察期 zkserver给zkclient的通知 单独的回调线程
-void global_watcher(zhandle_t *zh, int type, int state, const char *path, void *watcherCtx){
-    if(type == ZOO_SESSION_EVENT){  // 回调消息类型是和会话相关的消息类型
-        if(state == ZOO_CONNECTED_STATE) // zkclient和zkserver连接成功
-        {
-            sem_t *sem = (sem_t*)zoo_get_context(zh);
-            sem_post(sem);
-        }
-    }
+ZkClient::ZkClient() : m_zhandle(nullptr)
+{
 }
-ZkClient::ZkClient() : m_zhandle(nullptr){}
-ZkClient::~ZkClient(){
-    if(m_zhandle != nullptr){
-        zookeeper_close(m_zhandle); // 关闭句柄，释放资源
+
+ZkClient::~ZkClient()
+{
+    zhandle_t* handle = m_zhandle;
+    m_zhandle = nullptr;
+    if (handle != nullptr) {
+        zookeeper_close(handle);
     }
 }
 
-// 连接zkServer
-void ZkClient::Start(){
-    std::string host = MprpcApplication::GetInstance().GetConfig().Load("zookeeperip");
-    std::string port = MprpcApplication::GetInstance().GetConfig().Load("zookeeperport");
-    std::string connstr = host + ":" + port;
-
-    /*
-    zookeeper_mt: 多线程版本
-    zookeeper的API客户端程序提供了三个线程
-    API调用线程
-    网络I/O线程 pthread_create 底层用poll
-    watcher回调线程 当客户端接受到server响应的消息，利用watcher回调线程处理
-    */
-   // 会话建立是异步的，只有当state为ZOO_CONNECTED_STATE之后才代表连接建立成功
-    sem_t sem;
-    sem_init(&sem, 0,0);
-
-    m_zhandle = zookeeper_init(connstr.data(), global_watcher, 30000, nullptr, &sem, 0); //这里成功只代表创建本地资源成功m_zhanlde（例如内存开辟初始化），不代表成功收到zkServer的响应
-
-    if(m_zhandle == nullptr){
-        std::cout << "zookeeper_init error!" << std::endl;
-        sem_destroy(&sem);
-        exit(EXIT_FAILURE);
+void ZkClient::GlobalWatcher(zhandle_t*, int type, int state,
+                             const char*, void* watcher_context)
+{
+    if (type != ZOO_SESSION_EVENT || watcher_context == nullptr) {
+        return;
     }
 
-    sem_wait(&sem); // 等待zkServer异步响应成功
-    sem_destroy(&sem);
-    std::cout << "zookeeper_init success!" << std::endl;
-}
-void ZkClient::Create(const char *path, const char *data, int datalen, int state){
-    char path_buffer[128];
-    int bufferlen = sizeof(path_buffer);
-
-    int flag = zoo_exists(m_zhandle, path, 0, nullptr);
-
-    if(ZNONODE == flag)
+    auto* client = static_cast<ZkClient*>(watcher_context);
     {
-        flag = zoo_create(m_zhandle, path, data, datalen, &ZOO_OPEN_ACL_UNSAFE, state, path_buffer, bufferlen);
-        if(flag == ZOK){
-            std::cout << "znode create success ... path: " << path << std::endl;
-        }else{
-            std::cout << "flag:" << flag << std::endl;
-            std::cout << "znode create error...paht:" << path << std::endl;
-            exit(EXIT_FAILURE);
+        std::lock_guard<std::mutex> lock(client->mutex_);
+        client->connected_ = state == ZOO_CONNECTED_STATE;
+        if (state == ZOO_EXPIRED_SESSION_STATE) {
+            client->expired_ = true;
         }
     }
+    client->connected_cv_.notify_all();
 }
-std::string ZkClient::GetData(const char *path){
-    char buffer[256];
-    int bufferlen = sizeof(buffer);
 
-    int flag = zoo_get(m_zhandle, path, 0, buffer, &bufferlen, nullptr);
+bool ZkClient::Start()
+{
+    zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (m_zhandle != nullptr && connected_) {
+        return true;
+    }
 
-    if(flag == ZOK){
-        return std::string(buffer, bufferlen);
+    if (m_zhandle != nullptr && expired_) {
+        zhandle_t* expired_handle = m_zhandle;
+        m_zhandle = nullptr;
+        expired_ = false;
+        lock.unlock();
+        zookeeper_close(expired_handle);
+        lock.lock();
     }
-    else{
-        std::cout << "get znode error.... path: " << path << std::endl;
-        return "";
+
+    if (m_zhandle == nullptr) {
+        const std::string host =
+            MprpcApplication::GetInstance().GetConfig().Load("zookeeperip");
+        const std::string port =
+            MprpcApplication::GetInstance().GetConfig().Load("zookeeperport");
+        const std::string connection_string = host + ":" + port;
+
+        m_zhandle = zookeeper_init(connection_string.c_str(),
+                                   &ZkClient::GlobalWatcher,
+                                   30000, nullptr, this, 0);
+        if (m_zhandle == nullptr) {
+            std::cerr << "zookeeper_init failed" << std::endl;
+            return false;
+        }
+        expired_ = false;
     }
-    return "";
+
+    const bool connected = connected_cv_.wait_for(
+        lock, std::chrono::seconds(10), [this] { return connected_; });
+    if (!connected) {
+        std::cerr << "zookeeper connection timed out" << std::endl;
+    }
+    return connected;
+}
+
+void ZkClient::Create(const char* path, const char* data,
+                      int data_length, int flags)
+{
+    if (m_zhandle == nullptr || path == nullptr) {
+        return;
+    }
+
+    const int exists = zoo_exists(m_zhandle, path, 0, nullptr);
+    if (exists == ZOK) {
+        return;
+    }
+    if (exists != ZNONODE) {
+        std::cerr << "zoo_exists failed: path=" << path
+                  << " code=" << exists << std::endl;
+        return;
+    }
+
+    char created_path[512] = {};
+    int created_path_length = sizeof(created_path);
+    const int result = zoo_create(m_zhandle, path, data, data_length,
+                                  &ZOO_OPEN_ACL_UNSAFE, flags,
+                                  created_path, created_path_length);
+    if (result != ZOK && result != ZNODEEXISTS) {
+        std::cerr << "zoo_create failed: path=" << path
+                  << " code=" << result << std::endl;
+    }
+}
+
+std::string ZkClient::CreateEphemeralSequential(
+    const std::string& path_prefix, const std::string& data)
+{
+    if (m_zhandle == nullptr) {
+        return {};
+    }
+
+    char created_path[512] = {};
+    int created_path_length = sizeof(created_path);
+    const int result = zoo_create(
+        m_zhandle, path_prefix.c_str(), data.data(),
+        static_cast<int>(data.size()), &ZOO_OPEN_ACL_UNSAFE,
+        ZOO_EPHEMERAL | ZOO_SEQUENCE, created_path, created_path_length);
+    if (result != ZOK) {
+        std::cerr << "failed to create provider node: path="
+                  << path_prefix << " code=" << result << std::endl;
+        return {};
+    }
+    return std::string(created_path);
+}
+
+std::string ZkClient::GetData(const char* path)
+{
+    if (m_zhandle == nullptr || path == nullptr) {
+        return {};
+    }
+
+    std::vector<char> buffer(4096);
+    int length = static_cast<int>(buffer.size());
+    const int result = zoo_get(m_zhandle, path, 0, buffer.data(),
+                               &length, nullptr);
+    if (result != ZOK) {
+        return {};
+    }
+    return std::string(buffer.data(), static_cast<std::size_t>(length));
+}
+
+std::vector<std::string> ZkClient::GetChildren(const std::string& path)
+{
+    std::vector<std::string> children;
+    if (m_zhandle == nullptr) {
+        return children;
+    }
+
+    String_vector values{};
+    const int result = zoo_get_children(m_zhandle, path.c_str(), 0, &values);
+    if (result != ZOK) {
+        return children;
+    }
+
+    children.reserve(static_cast<std::size_t>(values.count));
+    for (int i = 0; i < values.count; ++i) {
+        children.emplace_back(values.data[i]);
+    }
+    deallocate_String_vector(&values);
+    return children;
+}
+
+bool ZkClient::IsConnected() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connected_;
 }

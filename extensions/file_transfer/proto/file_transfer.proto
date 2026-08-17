@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package mprpc.file;
+
+option cc_generic_services = true;
+
+enum FileErrorCode {
+    FILE_OK = 0;
+    TRANSFER_NOT_FOUND = 1;
+    INVALID_OFFSET = 2;
+    SIZE_EXCEEDED = 3;
+    CHECKSUM_MISMATCH = 4;
+    FILE_IO_ERROR = 5;
+    INVALID_ARGUMENT = 6;
+    INVALID_STATE = 7;
+    CHUNK_CONFLICT = 8;
+    SERVER_BUSY = 9;
+}
+
+message FileResult{
+    FileErrorCode code = 1;
+    string error_message = 2;
+}
+
+message BeginUploadRequest{
+    string file_name = 1;
+    uint64 file_size = 2;
+    string file_sha256 = 3;
+    uint32 preferred_chunk_size = 4;
+    string requested_transfer_id = 5;
+}
+
+message BeginUploadResponse{
+    FileResult result = 1;
+    string transfer_id = 2;
+    uint32 accepted_chunk_size = 3;
+}
+
+message UploadChunkRequest{
+    string transfer_id = 1;
+    uint64 offset = 2;
+    bytes data = 3;
+    optional uint32 data_crc32 = 4;
+}
+
+message UploadChunkResponse{
+    FileResult result = 1;
+    uint64 acknowledged_offset = 2;
+    uint64 total_received_size = 3;
+    bool duplicate = 4;
+}
+
+message FinishUploadRequest{
+    string transfer_id = 1;
+}
+
+message FinishUploadResponse{
+    FileResult result = 1;
+    uint64 received_size = 2;
+}
+
+message AbortUploadRequest{
+    string transfer_id = 1;
+}
+
+message AbortUploadResponse{
+    FileResult result = 1;
+}
+
+message QueryUploadStatusRequest {
+    string transfer_id = 1;
+}
+
+message QueryUploadStatusResponse {
+    FileResult result = 1;
+    uint64 file_size = 2;
+    uint32 chunk_size = 3;
+    uint64 received_size = 4;
+    uint32 chunk_count = 5;
+    bytes received_bitmap = 6;
+}
+
+// Internal sidecar format used to recover active uploads after a restart.
+message UploadSessionMetadata {
+    string transfer_id = 1;
+    string original_file_name = 2;
+    uint64 expected_size = 3;
+    uint32 chunk_size = 4;
+    string expected_sha256 = 5;
+    bytes received_bitmap = 6;
+    repeated fixed32 chunk_crc32 = 7;
+}
+
+service FileTransferServiceRpc{
+    rpc BeginUpload(BeginUploadRequest)
+        returns (BeginUploadResponse);
+    rpc UploadChunk(UploadChunkRequest)
+        returns (UploadChunkResponse);
+    rpc FinishUpload(FinishUploadRequest)
+        returns (FinishUploadResponse);
+    rpc AbortUpload(AbortUploadRequest)
+        returns (AbortUploadResponse);
+    rpc QueryUploadStatus(QueryUploadStatusRequest)
+        returns (QueryUploadStatusResponse);
+}

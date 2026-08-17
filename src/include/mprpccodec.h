@@ -41,9 +41,14 @@ enum class MprpcErrorCode : uint16_t
     TIMEOUT = 1301,
     NETWORK_ERROR = 1302,
     INVALID_ADDRESS = 1303,
+    CANCELLED = 1304,
+    CONNECTION_CLOSED = 1305,
+    CHANNEL_CLOSED = 1306,
 
     // generic framework errors
     INTERNAL_ERROR = 1401,
+    IO_THREAD_BLOCKING_CALL = 1402,
+    SERVER_BUSY = 1403,
 };
 
 enum class DecodeStatus
@@ -54,6 +59,7 @@ enum class DecodeStatus
     INVALID_VERSION,
     FRAME_TOO_LARGE,
     BAD_FRAME,
+    CHECKSUM_MISMATCH,
 };
 
 struct MprpcHeader

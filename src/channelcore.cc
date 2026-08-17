@@ -1,11 +1,23 @@
 #include <charconv>
+#include <algorithm>
+#include <future>
+#include <utility>
 #include <muduo/net/InetAddress.h>
 
 #include "zookeeperutil.h"
 #include "channelcore.h"
 #include "proto/rpc_meta.pb.h"
 
-ChannelCore::ChannelCore() : loop_(io_thread_.startLoop()){}
+ChannelCore::ChannelCore()
+    : loop_(io_thread_.startLoop()),
+      callback_executor_(std::make_shared<BoundedExecutor>(2, 1024))
+{
+}
+
+ChannelCore::~ChannelCore()
+{
+    Shutdown();
+}
 
 CallHandle ChannelCore::StartCall(const std::string& service_name,
                 const std::string& method_name,
@@ -21,9 +33,32 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
     state->request_id = request_id;
     call_result.request_id = request_id;
 
+    bool channel_closed = false;
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_calls_[request_id] = state;
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            channel_closed = true;
+        } else {
+            pending_calls_[request_id] = state;
+        }
+    }
+
+    if (channel_closed) {
+        call_result.status_code = mprpc::MprpcErrorCode::CHANNEL_CLOSED;
+        call_result.error_msg = "RPC channel is closed";
+        RpcCompletion closed_completion;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->result = call_result;
+            state->completed = true;
+            closed_completion = std::move(state->completion);
+        }
+        state->phase.store(CallPhase::Completed, std::memory_order_release);
+        state->cv.notify_all();
+        if (closed_completion) {
+            closed_completion(state->result);
+        }
+        return state;
     }
 
     std::string request_frame;
@@ -38,7 +73,9 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
     }
 
     Endpoint endpoint;
-    mprpc::MprpcErrorCode status_code = GetEndpoint(service_name, method_name, &endpoint, &error_msg);
+    mprpc::MprpcErrorCode status_code = GetEndpoint(
+        service_name, method_name, options.affinity_key,
+        &endpoint, &error_msg);
     if(status_code != mprpc::MprpcErrorCode::OK)
     {
         call_result.status_code =status_code;
@@ -46,24 +83,37 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
         CompleteCall(request_id, std::move(call_result));
         return state;
     }
+
+    state->endpoint_key = endpoint.Key();
+
     // 发送rpc请求)
     if(options.timeout_ms != 0){
         std::weak_ptr<ChannelCore> weak_self = shared_from_this();
+        std::weak_ptr<CallState> weak_state = state;
 
         double timeout_seconds = static_cast<double>(options.timeout_ms) / 1000.0;
 
-        loop_->runAfter(
+        muduo::net::TimerId timer_id = loop_->runAfter(
             timeout_seconds,
-            [weak_self, request_id](){
+            [weak_self, weak_state, request_id](){
                 if(auto self = weak_self.lock()){
+                    std::string endpoint_key;
+                    if (auto call_state = weak_state.lock()) {
+                        endpoint_key = call_state->endpoint_key;
+                    }
                     RpcCallResult timeout_result;
                     timeout_result.request_id = request_id;
                     timeout_result.status_code = mprpc::MprpcErrorCode::TIMEOUT;
                     timeout_result.error_msg = "RPC call timeout!";
 
                     self->CompleteCall(request_id, std::move(timeout_result));
+                    self->RetireDisconnectedSession(endpoint_key);
                 }
             });
+
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->timer_id = timer_id;
+        state->has_timer = true;
     }
 
     SendFrame(endpoint, std::move(request_frame));
@@ -87,6 +137,21 @@ RpcCallResult ChannelCore::WaitCall(const CallHandle& state){
     );
     return state->result;
 }
+
+bool ChannelCore::CancelCall(uint64_t request_id)
+{
+    RpcCallResult result;
+    result.request_id = request_id;
+    result.status_code = mprpc::MprpcErrorCode::CANCELLED;
+    result.error_msg = "RPC call cancelled";
+    return CompleteCall(request_id, std::move(result));
+}
+
+bool ChannelCore::IsInIoThread() const
+{
+    return loop_ != nullptr && loop_->isInLoopThread();
+}
+
 bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
 {
     std::shared_ptr<CallState> state;
@@ -107,24 +172,127 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
         pending_calls_.erase(it);
     }
     
+    muduo::net::TimerId timer_id;
+    bool cancel_timer = false;
+    RpcCompletion completion;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->has_timer) {
+            timer_id = state->timer_id;
+            state->has_timer = false;
+            cancel_timer = true;
+        }
         state->result = std::move(result);
         state->completed = true;
+        completion = std::move(state->completion);
     }
 
-    state->phase.store(CallPhase::Completed);
+    if (cancel_timer && loop_ != nullptr) {
+        loop_->cancel(timer_id);
+    }
+
+    state->phase.store(CallPhase::Completed, std::memory_order_release);
 
     state->cv.notify_all();
 
-    if(state->completion){
-        state->completion(state->result);
+    if(completion){
+        auto task = [state, completion = std::move(completion)]() mutable {
+            completion(state->result);
+        };
+        if (!callback_executor_ || !callback_executor_->TrySubmit(task)) {
+            task();
+        }
     }
 
     return true;
 }
+
+void ChannelCore::FailCallsForEndpoint(const std::string& endpoint_key,
+                                       mprpc::MprpcErrorCode code,
+                                       const std::string& message)
+{
+    std::vector<uint64_t> request_ids;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        for (const auto& entry : pending_calls_) {
+            if (entry.second->endpoint_key == endpoint_key) {
+                request_ids.push_back(entry.first);
+            }
+        }
+    }
+
+    for (uint64_t request_id : request_ids) {
+        RpcCallResult result;
+        result.request_id = request_id;
+        result.status_code = code;
+        result.error_msg = message;
+        CompleteCall(request_id, std::move(result));
+    }
+}
+
+void ChannelCore::FailAllPending(mprpc::MprpcErrorCode code,
+                                 const std::string& message)
+{
+    std::vector<uint64_t> request_ids;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        request_ids.reserve(pending_calls_.size());
+        for (const auto& entry : pending_calls_) {
+            request_ids.push_back(entry.first);
+        }
+    }
+
+    for (uint64_t request_id : request_ids) {
+        RpcCallResult result;
+        result.request_id = request_id;
+        result.status_code = code;
+        result.error_msg = message;
+        CompleteCall(request_id, std::move(result));
+    }
+}
+
+void ChannelCore::Shutdown()
+{
+    bool expected = false;
+    if (!shutting_down_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    FailAllPending(mprpc::MprpcErrorCode::CHANNEL_CLOSED,
+                   "RPC channel closed");
+
+    if (loop_ != nullptr) {
+        if (loop_->isInLoopThread()) {
+            for (auto& entry : sessions_) {
+                entry.second->client->disconnect();
+                entry.second->client->stop();
+            }
+            sessions_.clear();
+        } else {
+            auto stopped = std::make_shared<std::promise<void>>();
+            std::future<void> done = stopped->get_future();
+            loop_->runInLoop([this, stopped] {
+                for (auto& entry : sessions_) {
+                    entry.second->client->disconnect();
+                    entry.second->client->stop();
+                }
+                sessions_.clear();
+                stopped->set_value();
+            });
+            done.wait();
+        }
+    }
+
+    if (callback_executor_) {
+        callback_executor_->Shutdown(true);
+    }
+}
 void ChannelCore::SendFrame(Endpoint endpoint, std::string frame)
 {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
     auto self = shared_from_this();
 
     loop_->runInLoop([self, 
@@ -231,6 +399,12 @@ void ChannelCore::OnConnection(const std::string& endpoint_key, const muduo::net
     session.connecting = false;
 
     if(!conn || !conn->connected()){
+        session.waiting_frames.clear();
+        InvalidateEndpoint(endpoint_key);
+        FailCallsForEndpoint(endpoint_key,
+                             mprpc::MprpcErrorCode::CONNECTION_CLOSED,
+                             "RPC connection closed");
+        RetireDisconnectedSession(endpoint_key);
         return;
     }
 
@@ -238,6 +412,36 @@ void ChannelCore::OnConnection(const std::string& endpoint_key, const muduo::net
         conn->send(session.waiting_frames.front());
         session.waiting_frames.pop_front();
     }
+}
+
+void ChannelCore::RetireDisconnectedSession(
+    const std::string& endpoint_key)
+{
+    if (endpoint_key.empty() || loop_ == nullptr ||
+        shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::weak_ptr<ChannelCore> weak_self = shared_from_this();
+    loop_->queueInLoop([weak_self, endpoint_key] {
+        auto self = weak_self.lock();
+        if (!self || self->shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        auto it = self->sessions_.find(endpoint_key);
+        if (it == self->sessions_.end()) {
+            return;
+        }
+
+        const auto connection = it->second->client->connection();
+        if (connection && connection->connected()) {
+            return;
+        }
+
+        it->second->client->stop();
+        self->sessions_.erase(it);
+    });
 }
 
 bool ChannelCore::BuildRequestFrame(const std::string& service_name,
@@ -313,48 +517,129 @@ RpcCallResult ChannelCore::ParseResponseFrame(const mprpc::MprpcFrame& response_
 }
 mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
                     const std::string& method_name,
+                    const std::string& affinity_key,
                     Endpoint* endpoint,
                     std::string* error_msg)
 {
-    // 在zk上查询服务所在的host信息
-    ZkClient zkCli;
-    zkCli.Start();
     std::string method_path = "/" + service_name + "/" + method_name;
-    std::string host_data = zkCli.GetData(method_path.data());
-    if(host_data.empty()){
-        *error_msg = method_path + " does not exist!";
-        return mprpc::MprpcErrorCode::SERVICE_NOT_FOUND;
+    const std::string providers_path = method_path + "/providers";
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(discovery_mutex_);
+    if (zk_client_ && !zk_client_->IsConnected()) {
+        endpoint_cache_.clear();
+    }
+    auto cached = endpoint_cache_.find(method_path);
+    if (cached != endpoint_cache_.end() &&
+        cached->second.expires_at > now &&
+        !cached->second.endpoints.empty()) {
+        EndpointCacheEntry& entry = cached->second;
+        if (affinity_key.empty()) {
+            *endpoint = entry.endpoints[
+                entry.next_index % entry.endpoints.size()];
+            ++entry.next_index;
+        } else {
+            uint64_t hash = 1469598103934665603ULL;
+            for (unsigned char c : affinity_key) {
+                hash ^= c;
+                hash *= 1099511628211ULL;
+            }
+            *endpoint = entry.endpoints[hash % entry.endpoints.size()];
+        }
+        return mprpc::MprpcErrorCode::OK;
     }
 
-    const std::size_t separator = host_data.find(":");
-    
-    if(separator == std::string::npos ||
-        separator == 0 || 
-        separator + 1 >= host_data.size())
-    {
-        *error_msg = method_path + " address is invalid!";
-        return mprpc::MprpcErrorCode::INVALID_ADDRESS;
+    if (!zk_client_) {
+        zk_client_ = std::make_unique<ZkClient>();
+    }
+    if (!zk_client_->Start()) {
+        *error_msg = "ZooKeeper is unavailable";
+        return mprpc::MprpcErrorCode::NETWORK_ERROR;
     }
 
-    const std::string ip = host_data.substr(0, separator);
-    const std::string port_text = host_data.substr(separator + 1);
+    std::vector<Endpoint> endpoints;
+    const std::vector<std::string> providers =
+        zk_client_->GetChildren(providers_path);
+    bool invalid_address = false;
+    for (const std::string& provider : providers) {
+        const std::string host_data =
+            zk_client_->GetData((providers_path + "/" + provider).c_str());
+        const std::size_t separator = host_data.rfind(':');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 >= host_data.size()) {
+            invalid_address = true;
+            continue;
+        }
 
-    uint32_t port = 0;
+        uint32_t port = 0;
+        const std::string port_text = host_data.substr(separator + 1);
+        const char* begin = port_text.data();
+        const char* end = begin + port_text.size();
+        auto [ptr, ec] = std::from_chars(begin, end, port);
+        if (ec != std::errc{} || ptr != end || port == 0 || port > 65535) {
+            invalid_address = true;
+            continue;
+        }
 
-    const char* begin = port_text.data();
-    const char* end = port_text.data() + port_text.size();
-
-    auto [ptr, ec] = std::from_chars(begin, end, port);
-    if(ec != std::errc{} ||
-        ptr != end ||
-        port == 0 ||
-        port > 65535)
-    {
-        *error_msg = method_path + " port is invalid!";
-        return mprpc::MprpcErrorCode::INVALID_ADDRESS;
+        endpoints.push_back(
+            Endpoint{host_data.substr(0, separator),
+                     static_cast<uint16_t>(port)});
     }
 
-    endpoint->ip = ip;
-    endpoint->port = static_cast<uint16_t>(port);
+    if (endpoints.empty()) {
+        *error_msg = invalid_address
+            ? method_path + " has no valid provider address"
+            : method_path + " has no available provider";
+        return invalid_address
+            ? mprpc::MprpcErrorCode::INVALID_ADDRESS
+            : mprpc::MprpcErrorCode::SERVICE_NOT_FOUND;
+    }
+
+    std::sort(endpoints.begin(), endpoints.end(),
+              [](const Endpoint& left, const Endpoint& right) {
+                  return left.Key() < right.Key();
+              });
+    endpoints.erase(
+        std::unique(endpoints.begin(), endpoints.end(),
+                    [](const Endpoint& left, const Endpoint& right) {
+                        return left.ip == right.ip &&
+                               left.port == right.port;
+                    }),
+        endpoints.end());
+    EndpointCacheEntry entry;
+    entry.endpoints = std::move(endpoints);
+    entry.next_index = 1;
+    entry.expires_at = now + std::chrono::seconds(3);
+    if (affinity_key.empty()) {
+        *endpoint = entry.endpoints.front();
+    } else {
+        uint64_t hash = 1469598103934665603ULL;
+        for (unsigned char c : affinity_key) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        *endpoint = entry.endpoints[hash % entry.endpoints.size()];
+    }
+    endpoint_cache_[method_path] = std::move(entry);
     return mprpc::MprpcErrorCode::OK;
+}
+
+void ChannelCore::InvalidateEndpoint(const std::string& endpoint_key)
+{
+    std::lock_guard<std::mutex> lock(discovery_mutex_);
+    for (auto it = endpoint_cache_.begin(); it != endpoint_cache_.end();) {
+        auto& endpoints = it->second.endpoints;
+        endpoints.erase(
+            std::remove_if(endpoints.begin(), endpoints.end(),
+                           [&endpoint_key](const Endpoint& endpoint) {
+                               return endpoint.Key() == endpoint_key;
+                           }),
+            endpoints.end());
+        if (endpoints.empty()) {
+            it = endpoint_cache_.erase(it);
+        } else {
+            it->second.expires_at = std::chrono::steady_clock::now();
+            ++it;
+        }
+    }
 }

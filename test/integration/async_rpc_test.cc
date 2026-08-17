@@ -253,6 +253,72 @@ bool TestConcurrentAsyncCalls(
     return passed;
 }
 
+bool TestCancellation(fixbug::FriendServiceRpc_Stub* stub)
+{
+    fixbug::GetFriendListRequest request;
+    request.set_userid(9999);
+
+    auto context = std::make_shared<AsyncContext>();
+    context->controller.SetTimeoutMs(3000);
+    google::protobuf::Closure* done =
+        google::protobuf::NewPermanentCallback(&OnAsyncDone, context);
+
+    stub->GetFriendList(&context->controller, &request,
+                        &context->response, done);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    context->controller.StartCancel();
+
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const bool completed = context->cv.wait_for(
+        lock, std::chrono::seconds(1), [&context] {
+            return context->completed;
+        });
+    lock.unlock();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    lock.lock();
+    const bool passed = completed && context->callback_count == 1 &&
+        context->controller.IsCanceled() && context->controller.Failed() &&
+        context->controller.ErrorText().find("cancel") != std::string::npos;
+    lock.unlock();
+    delete done;
+
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": cancellation completes exactly once" << std::endl;
+    return passed;
+}
+
+bool TestChannelShutdown()
+{
+    auto channel = std::make_unique<MprpcChannel>();
+    auto stub = std::make_unique<fixbug::FriendServiceRpc_Stub>(channel.get());
+
+    fixbug::GetFriendListRequest request;
+    request.set_userid(9999);
+    auto context = std::make_shared<AsyncContext>();
+    context->controller.SetTimeoutMs(5000);
+    google::protobuf::Closure* done =
+        google::protobuf::NewCallback(&OnAsyncDone, context);
+
+    stub->GetFriendList(&context->controller, &request,
+                        &context->response, done);
+    stub.reset();
+    channel.reset();
+
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const bool completed = context->cv.wait_for(
+        lock, std::chrono::seconds(1), [&context] {
+            return context->completed;
+        });
+    const bool passed = completed && context->callback_count == 1 &&
+        context->controller.Failed() &&
+        context->controller.ErrorText().find("closed") != std::string::npos;
+
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": channel shutdown completes pending calls" << std::endl;
+    return passed;
+}
+
 int main(int argc, char** argv)
 {
     MprpcApplication::Init(argc, argv);
@@ -270,10 +336,18 @@ int main(int argc, char** argv)
     bool concurrent =
         TestConcurrentAsyncCalls(&stub);
 
+    bool cancelled =
+        TestCancellation(&stub);
+
+    bool channel_shutdown =
+        TestChannelShutdown();
+
     bool passed =
         returns_immediately &&
         timeout_once &&
-        concurrent;
+        concurrent &&
+        cancelled &&
+        channel_shutdown;
 
     return passed ? 0 : 1;
 }

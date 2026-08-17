@@ -79,6 +79,37 @@ int main(){
     assert(frame2.body == body2);
 
     // 非法包测试
+    // CRC32 detects corruption in an otherwise structurally valid header.
+    {
+        std::string corrupted_header = encoded;
+        corrupted_header[19] ^= 0x01;
+        mprpc::MprpcFrame bad_frame;
+        size_t bad_bytes_consumed = 0;
+        assert(mprpc::MprpcCodec::Decode(
+                   corrupted_header, &bad_frame, &bad_bytes_consumed) ==
+               mprpc::DecodeStatus::CHECKSUM_MISMATCH);
+        assert(bad_bytes_consumed == 0);
+    }
+    // CRC32 also covers every body byte.
+    {
+        std::string corrupted_body = encoded;
+        corrupted_body.back() ^= 0x01;
+        mprpc::MprpcFrame bad_frame;
+        size_t bad_bytes_consumed = 0;
+        assert(mprpc::MprpcCodec::Decode(
+                   corrupted_body, &bad_frame, &bad_bytes_consumed) ==
+               mprpc::DecodeStatus::CHECKSUM_MISMATCH);
+    }
+    {
+        std::string corrupted_checksum = encoded;
+        corrupted_checksum[27] ^= 0x01;
+        mprpc::MprpcFrame bad_frame;
+        size_t bad_bytes_consumed = 0;
+        assert(mprpc::MprpcCodec::Decode(
+                   corrupted_checksum, &bad_frame, &bad_bytes_consumed) ==
+               mprpc::DecodeStatus::CHECKSUM_MISMATCH);
+    }
+
     // 测试非法魔数
     {
         std::string bad_magic = encoded;
