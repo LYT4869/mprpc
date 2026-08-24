@@ -26,7 +26,7 @@ struct BenchmarkConfig
     uint32_t window = 8;
     uint32_t concurrency = 1;
     uint32_t samples = 10;
-    uint32_t warmup = 5;
+    uint32_t warmup = 3;
     bool cold_connections = false;
     bool percentiles_valid = false;
     bool allow_failures = false;
@@ -49,7 +49,7 @@ struct CommandLine
     uint32_t window = 8;
     uint32_t concurrency = 1;
     uint32_t samples = 10;
-    uint32_t warmup = 5;
+    uint32_t warmup = 3;
 };
 
 struct RunAggregate
@@ -183,18 +183,18 @@ std::vector<BenchmarkConfig> BuildProfile(const CommandLine& command)
         }
     } else if (command.profile == "latency") {
         for (uint32_t concurrency : {1U, 4U, 8U}) {
-            append(1, 8, concurrency, 100, 5, true);
+            append(1, 8, concurrency, 100, 3, true);
         }
     } else if (command.profile == "window") {
         for (uint32_t window : {1U, 2U, 4U, 8U, 16U}) {
-            append(16, window, 1, 10, 5, false);
+            append(16, window, 1, 10, 3, false);
         }
     } else if (command.profile == "saturation") {
         for (uint32_t concurrency : {1U, 2U, 4U, 8U}) {
-            append(64, 8, concurrency, 5, 5, false, true);
+            append(64, 8, concurrency, 5, 3, false, true);
         }
     } else if (command.profile == "custom") {
-        append(8, 8, 1, 10, 5, command.samples >= 100);
+        append(8, 8, 1, 10, 3, command.samples >= 100);
     }
     return configs;
 }
@@ -324,11 +324,45 @@ mprpc::file::UploadFileResult UploadOnce(
         options);
 }
 
+bool RunWarmup(const BenchmarkConfig& config,
+               const std::filesystem::path& input,
+               std::vector<std::unique_ptr<
+                   mprpc::file::ParallelFileUploader>>* uploaders)
+{
+    // Warm each persistent connection without turning warmup into a load test.
+    for (uint32_t worker = 0; worker < config.concurrency; ++worker) {
+        for (uint32_t attempt = 0;
+             attempt < config.warmup;
+             ++attempt) {
+            std::unique_ptr<mprpc::file::ParallelFileUploader> cold;
+            auto* uploader = (*uploaders)[worker].get();
+            if (config.cold_connections) {
+                cold = std::make_unique<
+                    mprpc::file::ParallelFileUploader>();
+                uploader = cold.get();
+            }
+            const auto result = UploadOnce(uploader, input, config);
+            if (!result.ok) {
+                std::cerr << "benchmark warmup failed for uploader "
+                          << worker << ", attempt " << attempt + 1
+                          << ": " << result.error_message << '\n';
+                return false;
+            }
+        }
+    }
+    std::cerr << "benchmark warmup complete: uploaders="
+              << config.concurrency
+              << " uploads_per_uploader=" << config.warmup
+              << " total=" << config.concurrency * config.warmup
+              << '\n';
+    return true;
+}
+
 void RunPhase(const BenchmarkConfig& config,
               const std::filesystem::path& input,
               uint32_t count,
               std::vector<std::unique_ptr<
-                  mprpc::file::ParallelFileUploader>>* warm_uploaders,
+                  mprpc::file::ParallelFileUploader>>* uploaders,
               RunAggregate* aggregate)
 {
     std::atomic<uint32_t> next{0};
@@ -339,7 +373,7 @@ void RunPhase(const BenchmarkConfig& config,
                 const uint32_t index = next.fetch_add(1);
                 if (index >= count) break;
                 std::unique_ptr<mprpc::file::ParallelFileUploader> cold;
-                auto* uploader = (*warm_uploaders)[worker].get();
+                auto* uploader = (*uploaders)[worker].get();
                 if (config.cold_connections) {
                     cold = std::make_unique<
                         mprpc::file::ParallelFileUploader>();
@@ -350,17 +384,12 @@ void RunPhase(const BenchmarkConfig& config,
                 const double latency =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start).count();
-                if (aggregate != nullptr) {
-                    RecordResult(aggregate, result, latency);
-                    if (cold) {
-                        std::lock_guard<std::mutex> lock(aggregate->mutex);
-                        AddRpcValues(
-                            &aggregate->rpc,
-                            cold->GetRpcMetricsSnapshot().total);
-                    }
-                } else if (!result.ok) {
-                    std::cerr << "benchmark warmup failed: "
-                              << result.error_message << '\n';
+                RecordResult(aggregate, result, latency);
+                if (cold) {
+                    std::lock_guard<std::mutex> lock(aggregate->mutex);
+                    AddRpcValues(
+                        &aggregate->rpc,
+                        cold->GetRpcMetricsSnapshot().total);
                 }
             }
         });
@@ -368,8 +397,9 @@ void RunPhase(const BenchmarkConfig& config,
     for (auto& worker : workers) worker.join();
 }
 
-std::string RunConfiguration(const BenchmarkConfig& config,
-                             const std::filesystem::path& input)
+bool RunConfiguration(const BenchmarkConfig& config,
+                      const std::filesystem::path& input,
+                      std::string* result_row)
 {
     std::vector<std::unique_ptr<mprpc::file::ParallelFileUploader>>
         uploaders;
@@ -379,7 +409,9 @@ std::string RunConfiguration(const BenchmarkConfig& config,
             mprpc::file::ParallelFileUploader>());
     }
 
-    RunPhase(config, input, config.warmup, &uploaders, nullptr);
+    if (!RunWarmup(config, input, &uploaders)) {
+        return false;
+    }
     std::vector<RpcMetricValues> baselines;
     for (const auto& uploader : uploaders) {
         baselines.push_back(uploader->GetRpcMetricsSnapshot().total);
@@ -428,7 +460,8 @@ std::string RunConfiguration(const BenchmarkConfig& config,
         << aggregate.rpc.callback_rejected << ','
         << aggregate.rpc.active << ',' << cpu_seconds << ','
         << CurrentRssKiB() << ',' << PeakRssKiB();
-    return row.str();
+    *result_row = row.str();
+    return true;
 }
 } // namespace
 
@@ -464,7 +497,8 @@ int main(int argc, char** argv)
         }
     }
     std::ostream& output = output_file ? output_file : std::cout;
-    output << "size_mib,window,concurrency,samples,warmup,connection_mode,"
+    output << "size_mib,window,concurrency,samples,warmup_per_uploader,"
+              "connection_mode,"
               "success,failed,throughput_mib_s,p50_ms,p95_ms,p99_ms,"
               "percentiles_valid,retries,retry_exhausted,chunk_attempts,"
               "duplicate_chunks,queue_rejected,max_in_flight,rpc_started,"
@@ -487,7 +521,11 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
-        const std::string row = RunConfiguration(config, input);
+        std::string row;
+        if (!RunConfiguration(config, input, &row)) {
+            std::cerr << "benchmark configuration aborted during warmup\n";
+            return 2;
+        }
         output << row << '\n';
         output.flush();
         std::istringstream parser(row);

@@ -204,11 +204,11 @@ RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟�
 ./test/integration/run_release_benchmark.sh saturation
 ```
 
-脚本使用独立 `build-release`，每组排除 5 次预热，并采集客户端/Provider 的 `/proc`
-CPU 与 RSS。2026-08-24 的本机 WSL2 回环结果中，16 MiB 单上传从窗口 1 的
+脚本使用独立 `build-release`，正式计时前会让每个 uploader 分别完成 3 次预热，并
+采集客户端/Provider 的 `/proc` CPU 与 RSS。2026-08-24 的本机 WSL2 回环结果中，16 MiB 单上传从窗口 1 的
 43.46 MiB/s 增长到窗口 8 的 52.07 MiB/s，窗口 16 回落至 49.47 MiB/s 且峰值 RSS
 继续上升。1 MiB 延迟组每个并发档有 100 个成功样本；并发 8 的 P99 上升到
-628.45 ms。64 MiB 饱和组在并发 8 出现 2 次快速 `SERVER_BUSY`，说明系统到达有界
+248.74 ms。64 MiB 饱和组在并发 8 出现 4 次快速 `SERVER_BUSY`，说明系统到达有界
 队列保护点。
 
 环境、命令、解释和原始 CSV 见
