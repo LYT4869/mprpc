@@ -172,3 +172,33 @@ target_link_libraries(
     mprpc_file_transfer_client
     Threads::Threads
 )
+
+if(BUILD_TESTING)
+    add_test(
+        NAME file_transfer_benchmark_invalid_profile
+        COMMAND file_transfer_benchmark --profile unknown
+    )
+    set_tests_properties(
+        file_transfer_benchmark_invalid_profile
+        PROPERTIES WILL_FAIL TRUE
+    )
+
+    add_test(
+        NAME file_transfer_benchmark_invalid_window
+        COMMAND file_transfer_benchmark --profile custom --window 0
+    )
+    set_tests_properties(
+        file_transfer_benchmark_invalid_window
+        PROPERTIES WILL_FAIL TRUE
+    )
+
+    add_test(
+        NAME file_transfer_benchmark_window_overflow
+        COMMAND file_transfer_benchmark --profile custom
+                --window 4294967297
+    )
+    set_tests_properties(
+        file_transfer_benchmark_window_overflow
+        PROPERTIES WILL_FAIL TRUE
+    )
+endif()

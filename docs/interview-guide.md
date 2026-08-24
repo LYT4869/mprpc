@@ -7,9 +7,10 @@
 
 - 基于 C++17、Muduo、Protobuf 和 ZooKeeper 实现 RPC 框架，设计 28 字节固定协议头，支持半包/粘包拆帧、request ID 并发关联、CRC32 校验和长连接复用。
 - 统一同步与异步调用链，通过 `CallState + pending_calls` 管理超时、取消、断线和 Channel 关闭竞争，使用 CAS 保证请求只完成一次，并将用户回调隔离到有界执行器。
+- 设计 CANCEL 控制帧和服务端 deadline，以“连接身份 + request ID”管理活动调用，实现客户端到 Provider 的协作式取消传播和迟到完成抑制。
 - 实现大文件上传服务，使用 `ftruncate + pwrite + 分片位图` 支持乱序并发上传，通过分片 CRC32、内容比对和 SHA-256 实现幂等重试及端到端完整性校验。
 - 使用 Protobuf sidecar 和原子 rename 实现进程重启恢复；客户端以滑动窗口并发发送缺失分片，对可恢复网络错误进行指数退避重试。
-- 设计有界 outstanding 和快速过载拒绝，完成真实中断恢复 E2E 与窗口/文件大小/并发矩阵压测，并分析连接、fsync、磁盘和线程池瓶颈。
+- 设计有界 outstanding 和快速过载拒绝，增加按方法延迟直方图与错误分类指标；完成真实中断恢复 E2E 和可复现 Release 压测，基于吞吐、P50/P95/P99、CPU、RSS 与拒绝数分析容量边界。
 
 ## 核心代码索引
 
@@ -19,13 +20,15 @@
 | 请求状态、超时、断线 | `src/channelcore.cc`, `src/include/channelcore.h` |
 | Protobuf 同步/异步适配 | `src/mprpcchannel.cc` |
 | 取消和错误语义 | `src/mprpccontroller.cc` |
-| Provider 分发 | `src/rpcprovider.cc` |
+| Provider 分发、deadline、活动调用 | `src/rpcprovider.cc` |
+| RPC 指标与 reporter | `src/rpcmetrics.cc`, `src/include/rpcmetrics.h` |
 | ZooKeeper 服务发现 | `src/zookeeperutil.cc` |
 | 有界执行器 | `src/boundedexecutor.cc` |
 | 分片状态和 RAII fd | `extensions/file_transfer/server/upload_session.h` |
 | pwrite、bitmap、sidecar | `extensions/file_transfer/server/upload_session_manager.cc` |
 | 滑动窗口和重试 | `extensions/file_transfer/client/parallel_file_uploader.cc` |
 | 故障 E2E | `test/integration/run_file_transfer_e2e.sh` |
+| Release 压测 | `extensions/file_transfer/benchmark/file_transfer_benchmark.cc`, `test/integration/run_release_benchmark.sh` |
 
 ## 30 个高频问题
 
@@ -70,6 +73,9 @@
 
 14. **取消与响应同时到达怎么办？**
     两者都调用 `CompleteCall`，只有先成功摘除 pending 并 CAS 的路径生效，后到者被忽略。
+
+    客户端取消还会尽力发送 CANCEL 帧；Provider 上 deadline、取消、断线和业务 done 也竞争
+    一次完成权。取消是协作式的，不保证回滚已执行副作用。
 
 15. **ZooKeeper 为什么用临时顺序 Provider 子节点？**
     临时节点随会话消失，顺序节点允许同一方法注册多个实例且名字不冲突。
@@ -119,4 +125,4 @@
     P50 表示典型延迟，P95/P99 观察尾延迟；样本少时高分位不稳定，所以项目原始结果明确标注环境和样本数。
 
 30. **下一步最合理的生产化改进是什么？**
-    TLS/认证、连接级流控、跨节点共享或粘性路由、目录 fsync/WAL、指标系统，以及压测 Release 构建和真实网络磁盘环境。
+    TLS/认证、连接级流控、跨节点共享 Session、目录 fsync/WAL、Prometheus 导出、调用链追踪，以及真实多机网络和独立磁盘压测。

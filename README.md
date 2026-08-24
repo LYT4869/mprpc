@@ -40,7 +40,7 @@ FileTransferService          有界任务队列、SessionManager、磁盘 I/O
 | 6 | 2 | header_len | 当前固定为 28 |
 | 8 | 4 | body_len | body 字节数，最大 64 MiB |
 | 12 | 8 | request_id | 并发请求与乱序响应关联 |
-| 20 | 2 | message_type | request/response/heartbeat |
+| 20 | 2 | message_type | request/response/cancel/heartbeat |
 | 22 | 2 | status_code | RPC 框架和传输状态 |
 | 24 | 4 | checksum | CRC32，计算时该字段视为 0 |
 
@@ -56,6 +56,12 @@ Decoder 在 Buffer 中循环拆帧：数据不足返回 `NEED_MORE_DATA`，完�
 4. 响应、超时、取消、断线和 Channel 关闭都竞争调用 `CompleteCall`。
 5. `CallPhase` 的 CAS 保证请求只完成一次；完成时摘除 pending 并取消 TimerId。
 6. 同步调用唤醒等待线程；异步回调投递到有界 callback executor，不阻塞 IO 线程。
+
+客户端超时或主动取消时，会先在本地竞争一次完成权，再沿原连接尽力发送空 body 的
+`CANCEL` 帧。Provider 以“连接身份 + request ID”索引活动调用，并使用相对
+`timeout_ms` 注册服务端 deadline。正常完成、deadline、取消和断线共用一次完成入口；
+取消属于协作式语义，业务会在入队、开始执行、最终哈希和发布前检查状态，但不会强行中断
+正在运行的系统调用，也不保证回滚已经发生的副作用。
 
 `RpcChannel::CallMethod` 的异步参数仍遵循 Protobuf 原生所有权：调用方必须保证
 controller、response 和 done 活到回调结束。文件上传客户端在内部用共享上下文封装
@@ -117,7 +123,18 @@ ParallelFileUploader 在 Begin 后查询 bitmap，只调度缺失分片，同时
 
 文件服务默认 4 个 worker、最多 32 个 outstanding（执行中加排队中）。`TrySubmit`
 失败时立即返回 `SERVER_BUSY`，不会阻塞 RpcProvider 的 IO 线程。执行器支持排空关闭，
-并记录 accepted/rejected/completed 计数。
+并记录 accepted/rejected/completed、当前 outstanding 和峰值水位。
+
+## Observability
+
+ChannelCore、RpcProvider 和文件服务分别持有自己的线程安全指标对象，不依赖全局可变
+单例。指标包括 active、成功、超时、取消、网络/框架错误、deadline、过载拒绝、重试、
+CRC 失败、有效字节数以及固定桶延迟直方图。支持总量和按已注册服务方法汇总，不使用
+request ID、transfer ID 或文件名等高基数标签。
+
+文件 Provider 默认每 10 秒输出一行 `key=value` 快照，配置
+`metricsintervalms=0` 可禁用。快照由多个原子字段独立读取，是近似瞬时视图，不承诺
+字段间的事务一致性。
 
 ## Build And Run
 
@@ -126,6 +143,14 @@ ParallelFileUploader 在 Begin 后查询 bitmap，只调度缺失分片，同时
 ```bash
 cmake -S . -B build
 cmake --build build -j2
+```
+
+Debug、Release 和 Sanitizer 产物分别位于各自构建目录，互不覆盖。启用 ASan/UBSan：
+
+```bash
+cmake -S . -B build-sanitize -DMPRPC_ENABLE_SANITIZERS=ON
+cmake --build build-sanitize -j2
+ctest --test-dir build-sanitize --output-on-failure
 ```
 
 启动 ZooKeeper：
@@ -146,14 +171,14 @@ zookeeperport=2181
 启动文件服务和并发上传客户端：
 
 ```bash
-./bin/file_transfer_server -i ./bin/test.conf /tmp/mprpc_uploads
-./bin/file_transfer_client -i ./bin/test.conf --window 8 ./large.bin
+./build/bin/file_transfer_server -i ./bin/test.conf /tmp/mprpc_uploads
+./build/bin/file_transfer_client -i ./bin/test.conf --window 8 ./large.bin
 ```
 
 断点续传可指定之前的 transfer ID：
 
 ```bash
-./bin/file_transfer_client -i ./bin/test.conf \
+./build/bin/file_transfer_client -i ./bin/test.conf \
   --transfer-id <id> --window 8 ./large.bin
 ```
 
@@ -166,21 +191,29 @@ ctest --test-dir build --output-on-failure
 ```
 
 RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟到响应竞争、取消和 Channel
-析构。文件 E2E 会真实启动 Provider，执行普通上传、强制中断、进程重启恢复和 SHA-256 对比。
+析构，还验证不同连接使用相同 request ID 不冲突。文件 E2E 会真实启动 Provider，执行普通
+上传、强制中断、进程重启恢复和 SHA-256 对比。
 它还会在滑动窗口传输期间重启 Provider，验证连接类错误重试、重复分片幂等和自动
 续传。测试产物保留在脚本输出的临时目录，便于排错。
 
 ## Benchmark
 
 ```bash
-./bin/file_transfer_benchmark -i ./bin/test.conf /tmp/mprpc_benchmark
+./test/integration/run_release_benchmark.sh latency
+./test/integration/run_release_benchmark.sh window
+./test/integration/run_release_benchmark.sh saturation
 ```
 
-2026-08-17 在本机 WSL2、回环网络、Debug 构建上的一次结果：48/48 上传成功。
-8 MiB 文件、单上传时，窗口 1 为 12.73 MiB/s，窗口 8 为 17.31 MiB/s；窗口 8、
-并发 2 时为 21.91 MiB/s。完整原始结果见
-[`docs/benchmark-2026-08-17.csv`](docs/benchmark-2026-08-17.csv)。这些数字用于观察
-窗口、并发、fsync 和连接建立成本的趋势，不代表生产环境性能。
+脚本使用独立 `build-release`，每组排除 5 次预热，并采集客户端/Provider 的 `/proc`
+CPU 与 RSS。2026-08-24 的本机 WSL2 回环结果中，16 MiB 单上传从窗口 1 的
+43.46 MiB/s 增长到窗口 8 的 52.07 MiB/s，窗口 16 回落至 49.47 MiB/s 且峰值 RSS
+继续上升。1 MiB 延迟组每个并发档有 100 个成功样本；并发 8 的 P99 上升到
+628.45 ms。64 MiB 饱和组在并发 8 出现 2 次快速 `SERVER_BUSY`，说明系统到达有界
+队列保护点。
+
+环境、命令、解释和原始 CSV 见
+[`docs/release-benchmark-2026-08-24.md`](docs/release-benchmark-2026-08-24.md)。这些结果
+用于选择窗口和分析容量边界，不代表生产网络或磁盘性能。
 
 ## Scope
 
