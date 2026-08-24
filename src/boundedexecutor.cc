@@ -13,6 +13,7 @@ struct BoundedExecutor::State
     std::condition_variable task_cv;
     bool stopping = false;
     bool drain = true;
+    // 同时统计排队中和正在执行的任务。
     std::size_t outstanding = 0;
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
@@ -59,6 +60,7 @@ bool BoundedExecutor::TrySubmit(Task task)
 
 void BoundedExecutor::Shutdown(bool drain)
 {
+    // worker 也持有 State，因此可从 worker 内安全发起关闭。
     const std::shared_ptr<State> state = state_;
     if (!state) {
         return;
@@ -83,6 +85,7 @@ void BoundedExecutor::Shutdown(bool drain)
             continue;
         }
         if (worker.get_id() == current) {
+            // worker 不能 join 自己，但共享的 State 仍保持有效。
             worker.detach();
         } else {
             worker.join();

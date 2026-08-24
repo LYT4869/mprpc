@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+// 固定线程数、限制 outstanding 数量的非阻塞任务执行器。
 class BoundedExecutor
 {
 public:
@@ -23,9 +24,13 @@ public:
     BoundedExecutor(const BoundedExecutor&) = delete;
     BoundedExecutor& operator=(const BoundedExecutor&) = delete;
 
+    // 尝试提交任务；队列已满或执行器关闭时立即返回 false。
     bool TrySubmit(Task task);
+
+    // 关闭执行器；drain 为 true 时先执行完已接收的任务。
     void Shutdown(bool drain = true);
 
+    // 返回执行器生命周期内的累计任务统计。
     uint64_t Accepted() const noexcept;
     uint64_t Rejected() const noexcept;
     uint64_t Completed() const noexcept;

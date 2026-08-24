@@ -5,6 +5,7 @@
 
 namespace mprpc::file
 {
+// 文件上传最终结果及重试、窗口等运行统计。
 struct UploadFileResult
 {
     bool ok = false;

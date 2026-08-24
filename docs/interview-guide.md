@@ -1,5 +1,8 @@
 # RPC 项目面试指南
 
+本文件用于快速复习。完整的分块问题、参考回答、追问链和八股延伸见
+[`interview-question-bank.md`](interview-question-bank.md)。
+
 ## 简历描述
 
 - 基于 C++17、Muduo、Protobuf 和 ZooKeeper 实现 RPC 框架，设计 28 字节固定协议头，支持半包/粘包拆帧、request ID 并发关联、CRC32 校验和长连接复用。

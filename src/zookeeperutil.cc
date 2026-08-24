@@ -25,6 +25,7 @@ void ZkClient::GlobalWatcher(zhandle_t*, int type, int state,
         return;
     }
 
+    // watcher 只发布会话状态，具体 ZK 操作由调用线程完成。
     auto* client = static_cast<ZkClient*>(watcher_context);
     {
         std::lock_guard<std::mutex> lock(client->mutex_);
@@ -70,6 +71,7 @@ bool ZkClient::Start()
         expired_ = false;
     }
 
+    // zookeeper_init 是异步的，需要等待会话 watcher 通知。
     const bool connected = connected_cv_.wait_for(
         lock, std::chrono::seconds(10), [this] { return connected_; });
     if (!connected) {
@@ -115,6 +117,7 @@ std::string ZkClient::CreateEphemeralSequential(
 
     char created_path[512] = {};
     int created_path_length = sizeof(created_path);
+    // 临时节点负责下线失效实例，顺序节点允许注册多个 Provider。
     const int result = zoo_create(
         m_zhandle, path_prefix.c_str(), data.data(),
         static_cast<int>(data.size()), &ZOO_OPEN_ACL_UNSAFE,

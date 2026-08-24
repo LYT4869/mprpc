@@ -22,6 +22,7 @@
 
 class ZkClient;
 
+// RPC 核心层产出的字节级调用结果，不依赖 Protobuf 消息类型。
 struct RpcCallResult
 {
     uint64_t request_id = 0;
@@ -38,6 +39,7 @@ struct RpcCallResult
 };
 using RpcCompletion = std::function<void(const RpcCallResult&)>;
 
+// 单次调用选项；affinity_key 用于有状态请求的稳定路由。
 struct CallOptions
 {
     uint32_t timeout_ms = 3000;
@@ -52,9 +54,11 @@ enum class CallPhase
 };
 
 
+// 记录一次在途调用的完成状态，并为同步调用提供等待条件。
 struct CallState
 {
     uint64_t request_id = 0;
+    // 用于只终止受某条断开连接影响的调用。
     std::string endpoint_key;
     RpcCallResult result;
     std::atomic<CallPhase> phase{CallPhase::Pending};
@@ -70,6 +74,7 @@ struct CallState
 };
 
 using CallHandle = std::shared_ptr<CallState>;
+// 管理服务发现、长连接、pending calls、超时和响应分发。
 class ChannelCore : public std::enable_shared_from_this<ChannelCore>
 {
 public:
@@ -79,13 +84,19 @@ public:
     ChannelCore(const ChannelCore&) = delete;
     ChannelCore& operator=(const ChannelCore&) = delete;
 
+    // 创建并注册调用状态，随后异步选择连接并发送请求帧。
     CallHandle StartCall(const std::string& service_name,
                    const std::string& method_name,
                    const std::string& request_payload,
                    const CallOptions& options,
                    RpcCompletion completion = {});
+    // 阻塞等待调用完成，仅供同步适配层使用。
     RpcCallResult WaitCall(const CallHandle& state);
+
+    // 通过 request_id 取消仍处于 pending 的调用。
     bool CancelCall(uint64_t request_id);
+
+    // 停止网络与回调执行器，并完成所有剩余调用。
     void Shutdown();
     bool IsInIoThread() const;
 
@@ -93,6 +104,7 @@ private:
     struct ClientSession
     {
         std::unique_ptr<muduo::net::TcpClient> client;
+        // 异步连接建立前，请求帧暂存在这里。
         std::deque<std::string> waiting_frames;
         bool connecting = false;
     };
@@ -118,6 +130,7 @@ private:
     std::mutex pending_mutex_;
     muduo::net::EventLoopThread io_thread_;
     muduo::net::EventLoop* loop_ = nullptr;
+    // 仅允许在 loop_ 所在线程中增删和读取。
     std::unordered_map<std::string, std::unique_ptr<ClientSession>> sessions_;
     std::shared_ptr<BoundedExecutor> callback_executor_;
     std::atomic<bool> shutting_down_{false};
@@ -133,8 +146,10 @@ private:
 
     void OnConnection(const std::string& endpoint_key, const muduo::net::TcpConnectionPtr& conn);
 
+    // 在 EventLoop 中循环拆帧并按 request_id 分发响应。
     void OnMessage(const muduo::net::TcpConnectionPtr& conn, muduo::net::Buffer*, muduo::Timestamp receive_time);
 
+    // 所有响应、超时、取消和断线共用的一次性完成入口。
     bool CompleteCall(uint64_t request_id, RpcCallResult result);
 
     void FailCallsForEndpoint(const std::string& endpoint_key,
@@ -155,6 +170,7 @@ private:
 
     RpcCallResult ParseResponseFrame(const mprpc::MprpcFrame& response_frame);
 
+    // 从短期缓存或 ZooKeeper 选择一个可用服务节点。
     mprpc::MprpcErrorCode GetEndpoint(const std::string& service_name,
                         const std::string& method_name,
                         const std::string& affinity_key,

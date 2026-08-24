@@ -48,6 +48,7 @@ void FileTransferServiceImpl::BeginUpload(google::protobuf::RpcController* contr
                     ::google::protobuf::Closure* done)
 {
     (void)controller;
+    // Protobuf request 仅被借用，投递任务前必须复制所需字段。
     std::string file_name = request->file_name();
     uint64_t file_size = request->file_size();
     std::string file_sha256 = request->file_sha256();
@@ -212,6 +213,7 @@ bool FileTransferServiceImpl::SubmitTask(
         return true;
     }
 
+    // 快速拒绝，避免 Provider I/O 线程阻塞等待队列。
     FillResult(response_result, SERVER_BUSY,
                "file transfer worker queue is full");
     if (done != nullptr) {
@@ -232,6 +234,7 @@ void FileTransferServiceImpl::FillResult(
     response_result->set_error_message(error_message);
 }
 
+// 后台周期检查空闲 Session，不占用 RPC 业务 worker。
 void FileTransferServiceImpl::CleanupLoop()
 {
     std::unique_lock<std::mutex> lock(cleanup_mutex_);

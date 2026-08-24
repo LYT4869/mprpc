@@ -10,11 +10,13 @@
 
 namespace mprpc::file
 {
+// 按 offset 顺序同步上传分片，作为正确性基线实现。
 class SequentialFileUploader
 {
 public:
     explicit SequentialFileUploader(uint32_t timeout_ms = 30000);
 
+    // 完整执行 Begin、逐块 UploadChunk 和 Finish 流程。
     UploadFileResult Upload(
         const std::filesystem::path& local_path,
         std::string remote_file_name = {},

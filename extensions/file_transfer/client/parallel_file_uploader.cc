@@ -136,6 +136,7 @@ struct UploadOperation
 
 struct ChunkCallContext
 {
+    // 持有本分片的 Protobuf 对象，直到 done 回调结束。
     MprpcController controller;
     UploadChunkRequest request;
     UploadChunkResponse response;
@@ -152,6 +153,7 @@ bool IsRetryable(mprpc::MprpcErrorCode code)
            code == mprpc::MprpcErrorCode::CONNECTION_CLOSED;
 }
 
+// 汇总分片结果，决定成功计数、重试入队或终止整个上传。
 void OnChunkDone(std::shared_ptr<UploadOperation> operation,
                  std::shared_ptr<ChunkCallContext> call)
 {
@@ -164,6 +166,7 @@ void OnChunkDone(std::shared_ptr<UploadOperation> operation,
     }
 
     if (call->controller.Failed()) {
+        // 只有瞬时传输错误才会重新放回调度队列。
         if (IsRetryable(call->controller.ErrorCode()) &&
             call->attempt < operation->options.max_retries) {
             const uint32_t multiplier =
@@ -326,6 +329,7 @@ UploadFileResult ParallelFileUploader::Upload(
     std::unique_ptr<int, void(*)(int*)> fd_guard(
         new int(local_fd), [](int* fd) { ::close(*fd); delete fd; });
 
+    // 同时在途的异步分片 RPC 不超过 window_size。
     while (true) {
         PendingChunk pending;
         bool launch = false;
@@ -390,6 +394,7 @@ UploadFileResult ParallelFileUploader::Upload(
             static_cast<uInt>(call->request.data().size()))));
         call->controller.SetTimeoutMs(options.chunk_timeout_ms);
         call->controller.SetAffinityKey(result.transfer_id);
+        // Closure 通过 shared_ptr 持有 operation 和 call。
         google::protobuf::Closure* done = google::protobuf::NewCallback(
             &OnChunkDone, operation, call);
         stub_.UploadChunk(&call->controller, &call->request,

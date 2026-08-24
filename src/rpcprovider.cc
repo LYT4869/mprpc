@@ -101,6 +101,7 @@ service_name method_name args  定义proto的message类型，进行数据头的�
 void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
         muduo::net::Buffer *buffer, muduo::Timestamp time)
 {    
+    // 一个 Buffer 可能包含半帧，也可能同时包含多个完整帧。
     while(buffer->readableBytes() > 0){
         std::string input(buffer->peek(), buffer->readableBytes());
 
@@ -228,6 +229,7 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
 
     google::protobuf::Message* response_raw = response.get();
 
+    // context 沿完成回调传递，并在响应发送后释放。
     RpcResponseContext* response_context = new RpcResponseContext{std::move(response), frame.header.request_id};
     google::protobuf::Closure* done = google::protobuf::NewCallback<RpcProvider, 
                                                                     muduo::net::TcpConnectionPtr,

@@ -39,6 +39,7 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
         if (shutting_down_.load(std::memory_order_acquire)) {
             channel_closed = true;
         } else {
+            // 必须先注册再发送，避免快速响应找不到调用状态。
             pending_calls_[request_id] = state;
         }
     }
@@ -164,6 +165,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
         }
         state = it->second;
         
+        // 响应、超时、取消和断线都在这里竞争一次完成权。
         CallPhase expected = CallPhase::Pending;
         if(!state->phase.compare_exchange_strong(expected, CallPhase::Completing)){
             return false;
@@ -196,6 +198,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
     state->cv.notify_all();
 
     if(completion){
+        // 执行用户回调时不能持有 pending 或 state 的锁。
         auto task = [state, completion = std::move(completion)]() mutable {
             completion(state->result);
         };
@@ -293,6 +296,7 @@ void ChannelCore::SendFrame(Endpoint endpoint, std::string frame)
     if (shutting_down_.load(std::memory_order_acquire)) {
         return;
     }
+    // 排队任务可能晚于当前函数执行，因此捕获 shared self。
     auto self = shared_from_this();
 
     loop_->runInLoop([self, 
@@ -423,6 +427,7 @@ void ChannelCore::RetireDisconnectedSession(
     }
 
     std::weak_ptr<ChannelCore> weak_self = shared_from_this();
+    // 等当前 TcpClient 回调退出后，再延迟销毁 session。
     loop_->queueInLoop([weak_self, endpoint_key] {
         auto self = weak_self.lock();
         if (!self || self->shutting_down_.load(std::memory_order_acquire)) {
@@ -599,6 +604,7 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
               [](const Endpoint& left, const Endpoint& right) {
                   return left.Key() < right.Key();
               });
+    // Provider 快速重启时，同一地址可能短暂存在两个 ZK 节点。
     endpoints.erase(
         std::unique(endpoints.begin(), endpoints.end(),
                     [](const Endpoint& left, const Endpoint& right) {

@@ -95,6 +95,7 @@ Sha256Result ComputeFileSha256(const std::filesystem::path& path)
 bool WriteAllAt(int fd, const char* data, std::size_t size,
                 uint64_t offset, std::string* error_message)
 {
+    // pwrite 不改变共享文件偏移，并且可能只完成部分写入。
     std::size_t written = 0;
     while (written < size) {
         const ssize_t count = ::pwrite(
@@ -147,6 +148,7 @@ bool WriteFileAtomically(const std::filesystem::path& path,
                          const std::string& data,
                          std::string* error_message)
 {
+    // 恢复时只会看到旧 sidecar 或完整写入的新 sidecar。
     const std::filesystem::path temporary = path.string() + ".tmp";
     UniqueFd fd(::open(temporary.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644));
     if (!fd.Valid()) {
@@ -293,6 +295,7 @@ BeginUploadResult UploadSessionManager::BeginUpload(
 
     session->file.Reset(::open(session->temporary_path.c_str(),
                               O_CREAT | O_EXCL | O_RDWR, 0644));
+    // ftruncate 固定逻辑大小，但不保证提前分配磁盘块。
     if (!session->file.Valid() ||
         ::ftruncate(session->file.Get(), static_cast<off_t>(file_size)) != 0) {
         result.code = FILE_IO_ERROR;
@@ -378,6 +381,7 @@ UploadChunkResult UploadSessionManager::UploadChunk(
             return result;
         }
         if (session->chunks[chunk_index] == ChunkState::Received) {
+            // CRC 用于快速筛选，内容比较用于排除碰撞。
             if (session->chunk_crc32[chunk_index] != data_crc32) {
                 result.code = CHUNK_CONFLICT;
                 result.err_msg = "duplicate chunk has different CRC32";
@@ -394,6 +398,7 @@ UploadChunkResult UploadSessionManager::UploadChunk(
             result.duplicate = true;
             return result;
         }
+        // 锁内预占分片，耗时的磁盘 I/O 放到锁外执行。
         session->chunks[chunk_index] = ChunkState::Writing;
     }
 
@@ -410,6 +415,7 @@ UploadChunkResult UploadSessionManager::UploadChunk(
         return result;
     }
 
+    // 将 bitmap 和 sidecar 作为一次串行状态提交。
     std::lock_guard<std::mutex> metadata_lock(session->metadata_mutex);
     std::lock_guard<std::mutex> lock(session->mutex);
     if (session->state != UploadState::Active ||
@@ -491,6 +497,7 @@ FinishUploadResult UploadSessionManager::FinishUpload(
             return result;
         }
 
+        // Finishing 阻止新分片进入，哈希和 rename 可在锁外执行。
         session->state = UploadState::Finishing;
         if (::fsync(session->file.Get()) != 0) {
             session->state = UploadState::Failed;
@@ -764,6 +771,7 @@ void UploadSessionManager::RecoverSessions()
         }
 
         if (valid) {
+            // received_size 根据持久化 bitmap 重新计算。
             for (uint32_t i = 0; i < session->chunk_count; ++i) {
                 session->chunk_crc32[i] = metadata.chunk_crc32(i);
                 if (session->chunks[i] == ChunkState::Received) {

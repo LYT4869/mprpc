@@ -79,6 +79,7 @@ void MprpcController::StartCancel(){
         callbacks.swap(cancel_callbacks_);
     }
 
+    // 框架和用户回调必须在 controller 锁外执行。
     if (handler) {
         handler();
     }
@@ -106,6 +107,7 @@ void MprpcController::NotifyOnCancel(google::protobuf::Closure* callback){
             cancel_callbacks_.push_back(callback);
         }
     }
+    // 取消发生后才注册的回调需要立即感知取消。
     if (run_now) {
         callback->Run();
     }
@@ -121,6 +123,7 @@ void MprpcController::SetCancelHandler(std::function<void()> handler)
             run_handler = cancel_handler_;
         }
     }
+    // 处理取消与 CallMethod 安装 handler 的竞争。
     if (run_handler) {
         run_handler();
     }

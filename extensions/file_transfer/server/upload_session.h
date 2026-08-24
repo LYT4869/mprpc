@@ -11,6 +11,7 @@
 
 namespace mprpc::file
 {
+// 独占管理 POSIX 文件描述符，离开作用域时自动 close。
 class UniqueFd
 {
 public:
@@ -50,6 +51,7 @@ private:
     int fd_ = -1;
 };
 
+// 一次文件上传会话的生命周期状态。
 enum class UploadState
 {
     Active,
@@ -60,6 +62,7 @@ enum class UploadState
     Expired,
 };
 
+// 单个分片的写入状态，Writing 用于并发预占。
 enum class ChunkState : uint8_t
 {
     Missing,
@@ -67,6 +70,7 @@ enum class ChunkState : uint8_t
     Received,
 };
 
+// 保存一次上传的文件信息、分片位图、校验值和持久化路径。
 struct UploadSession
 {
     std::string transfer_id;
@@ -91,6 +95,7 @@ struct UploadSession
     UploadState state = UploadState::Active;
 
     std::mutex mutex;
+    // 串行化 sidecar 替换；同时加锁时必须先获取此锁。
     std::mutex metadata_mutex;
 
     UploadSession() = default;

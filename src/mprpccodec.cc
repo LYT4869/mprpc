@@ -52,6 +52,7 @@ namespace
     uint32_t ComputeFrameChecksum(const char* data, uint32_t body_len){
         static constexpr unsigned char zeros[4] = {0, 0, 0, 0};
         uLong checksum = ::crc32(0L, Z_NULL, 0);
+        // 编解码计算 CRC 时，都将 checksum 字段视为 0。
         checksum = ::crc32(checksum,
                            reinterpret_cast<const Bytef*>(data), 24);
         checksum = ::crc32(checksum, zeros, 4);

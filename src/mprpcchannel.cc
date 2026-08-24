@@ -22,7 +22,7 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
     std::string service_name = sd->name(); // service_name
     std::string method_name = method->name(); // method_name
 
-    // 获取参数的序列化字符串长度args_size
+    // 同步完成序列化，返回后调用方即可销毁 request。
     std::string request_payload;
     if(request == nullptr || !request->SerializeToString(&request_payload)){
         if(controller != nullptr){
@@ -88,6 +88,7 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method, 
         return;
     }else{
         // 异步调用
+        // 这些 Protobuf 对象仅被借用，必须存活到 done 执行结束。
         RpcCompletion completion = [controller, response, done, mprpc_controller](const RpcCallResult& result){
             if (mprpc_controller != nullptr) {
                 mprpc_controller->ClearCancelHandler();
@@ -141,6 +142,7 @@ void MprpcChannel::FinishProtobufCall(
     }
 
     if (done != nullptr) {
+        // NewCallback 创建的 Closure 可能在 Run() 内自销毁。
         done->Run();
     }
 }
