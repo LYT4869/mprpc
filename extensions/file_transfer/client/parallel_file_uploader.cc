@@ -127,6 +127,10 @@ struct UploadOperation
     uint32_t completed = 0;
     uint32_t total_missing = 0;
     uint32_t retries = 0;
+    uint32_t retry_exhausted = 0;
+    uint32_t chunk_attempts = 0;
+    uint32_t duplicate_chunks = 0;
+    uint32_t queue_rejected = 0;
     uint32_t max_in_flight = 0;
     uint64_t bytes_uploaded = 0;
     bool failed = false;
@@ -179,6 +183,7 @@ void OnChunkDone(std::shared_ptr<UploadOperation> operation,
                         multiplier)});
             ++operation->retries;
         } else {
+            ++operation->retry_exhausted;
             operation->failed = true;
             operation->error_message = "UploadChunk RPC failed: " +
                                        call->controller.ErrorText();
@@ -189,6 +194,10 @@ void OnChunkDone(std::shared_ptr<UploadOperation> operation,
 
     if (!call->response.has_result() ||
         call->response.result().code() != FILE_OK) {
+        if (call->response.has_result() &&
+            call->response.result().code() == SERVER_BUSY) {
+            ++operation->queue_rejected;
+        }
         operation->failed = true;
         operation->error_message = call->response.has_result()
             ? "UploadChunk failed: " +
@@ -201,6 +210,9 @@ void OnChunkDone(std::shared_ptr<UploadOperation> operation,
     } else {
         ++operation->completed;
         operation->bytes_uploaded += call->data_size;
+        if (call->response.duplicate()) {
+            ++operation->duplicate_chunks;
+        }
     }
     operation->cv.notify_all();
 }
@@ -232,6 +244,11 @@ bool ReadChunk(int fd, uint64_t offset, std::size_t size,
 
 ParallelFileUploader::ParallelFileUploader() : stub_(&channel_)
 {
+}
+
+RpcMetricsSnapshot ParallelFileUploader::GetRpcMetricsSnapshot() const
+{
+    return channel_.GetMetricsSnapshot();
 }
 
 UploadFileResult ParallelFileUploader::Upload(
@@ -277,6 +294,10 @@ UploadFileResult ParallelFileUploader::Upload(
     stub_.BeginUpload(&begin_controller, &begin_request, &begin_response, nullptr);
     if (!CheckResult("BeginUpload", begin_controller, begin_response,
                      &result.error_message)) {
+        if (begin_response.has_result() &&
+            begin_response.result().code() == SERVER_BUSY) {
+            ++result.queue_rejected;
+        }
         return result;
     }
     result.transfer_id = begin_response.transfer_id();
@@ -295,6 +316,10 @@ UploadFileResult ParallelFileUploader::Upload(
                             &query_response, nullptr);
     if (!CheckResult("QueryUploadStatus", query_controller, query_response,
                      &result.error_message)) {
+        if (query_response.has_result() &&
+            query_response.result().code() == SERVER_BUSY) {
+            ++result.queue_rejected;
+        }
         return result;
     }
     if (query_response.file_size() != file_size ||
@@ -353,6 +378,7 @@ UploadFileResult ParallelFileUploader::Upload(
                 pending = *ready;
                 operation->pending.erase(ready);
                 ++operation->active;
+                ++operation->chunk_attempts;
                 operation->max_in_flight = std::max(
                     operation->max_in_flight, operation->active);
                 launch = true;
@@ -404,6 +430,10 @@ UploadFileResult ParallelFileUploader::Upload(
     {
         std::lock_guard<std::mutex> lock(operation->mutex);
         result.retries = operation->retries;
+        result.retry_exhausted = operation->retry_exhausted;
+        result.chunk_attempts = operation->chunk_attempts;
+        result.duplicate_chunks = operation->duplicate_chunks;
+        result.queue_rejected = operation->queue_rejected;
         result.max_in_flight = operation->max_in_flight;
         result.bytes_uploaded = operation->bytes_uploaded;
         if (operation->failed) {
@@ -422,6 +452,10 @@ UploadFileResult ParallelFileUploader::Upload(
                        &finish_response, nullptr);
     if (!CheckResult("FinishUpload", finish_controller, finish_response,
                      &result.error_message)) {
+        if (finish_response.has_result() &&
+            finish_response.result().code() == SERVER_BUSY) {
+            ++result.queue_rejected;
+        }
         return result;
     }
     if (finish_response.received_size() != file_size) {

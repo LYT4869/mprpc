@@ -6,6 +6,7 @@
 
 #include "file_transfer.pb.h"
 #include "mprpcchannel.h"
+#include "rpcmetrics.h"
 #include "upload_types.h"
 
 namespace mprpc::file
@@ -32,6 +33,8 @@ public:
         const std::filesystem::path& local_path,
         std::string remote_file_name = {},
         UploadOptions options = {});
+
+    RpcMetricsSnapshot GetRpcMetricsSnapshot() const;
 
 private:
     MprpcChannel channel_;

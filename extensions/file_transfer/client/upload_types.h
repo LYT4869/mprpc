@@ -12,6 +12,10 @@ struct UploadFileResult
     std::string transfer_id;
     uint64_t bytes_uploaded = 0;
     uint32_t retries = 0;
+    uint32_t retry_exhausted = 0;
+    uint32_t chunk_attempts = 0;
+    uint32_t duplicate_chunks = 0;
+    uint32_t queue_rejected = 0;
     uint32_t max_in_flight = 0;
     std::string error_message;
 };

@@ -90,7 +90,8 @@ int main()
         }
         const ServiceTaskStats saturated_stats = service.GetTaskStats();
         passed = passed && accepted >= 1 && rejected >= 1 &&
-            saturated_stats.rejected == static_cast<uint64_t>(rejected);
+            saturated_stats.rejected == static_cast<uint64_t>(rejected) &&
+            saturated_stats.peak_outstanding == 1;
 
         auto recovery = std::make_unique<Call>();
         recovery->request.set_file_name("recovered.bin");
@@ -115,7 +116,9 @@ int main()
         const ServiceTaskStats final_stats = service.GetTaskStats();
         std::cout << "accepted=" << final_stats.accepted
                   << " rejected=" << final_stats.rejected
-                  << " completed=" << final_stats.completed << '\n';
+                  << " completed=" << final_stats.completed
+                  << " peak_outstanding="
+                  << final_stats.peak_outstanding << '\n';
     }
 
     std::error_code error;
