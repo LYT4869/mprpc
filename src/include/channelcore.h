@@ -19,6 +19,7 @@
 #include <vector>
 #include "boundedexecutor.h"
 #include "mprpccodec.h"
+#include "rpcmetrics.h"
 
 class ZkClient;
 
@@ -58,6 +59,9 @@ enum class CallPhase
 struct CallState
 {
     uint64_t request_id = 0;
+    std::string method_name;
+    std::chrono::steady_clock::time_point started_at =
+        std::chrono::steady_clock::now();
     // 用于只终止受某条断开连接影响的调用。
     std::string endpoint_key;
     RpcCallResult result;
@@ -67,6 +71,7 @@ struct CallState
     std::condition_variable cv;
     bool completed = false;
     bool has_timer = false;
+    std::atomic<bool> request_sent{false};
     muduo::net::TimerId timer_id;
 
     RpcCompletion completion;
@@ -99,13 +104,23 @@ public:
     // 停止网络与回调执行器，并完成所有剩余调用。
     void Shutdown();
     bool IsInIoThread() const;
+    RpcMetricsSnapshot GetMetricsSnapshot() const;
 
 private:
+    struct OutboundFrame
+    {
+        uint64_t request_id = 0;
+        mprpc::MprpcMessageType message_type =
+            mprpc::MprpcMessageType::REQUEST;
+        std::string bytes;
+        std::weak_ptr<CallState> state;
+    };
+
     struct ClientSession
     {
         std::unique_ptr<muduo::net::TcpClient> client;
         // 异步连接建立前，请求帧暂存在这里。
-        std::deque<std::string> waiting_frames;
+        std::deque<OutboundFrame> waiting_frames;
         bool connecting = false;
     };
     struct Endpoint
@@ -133,14 +148,23 @@ private:
     // 仅允许在 loop_ 所在线程中增删和读取。
     std::unordered_map<std::string, std::unique_ptr<ClientSession>> sessions_;
     std::shared_ptr<BoundedExecutor> callback_executor_;
+    RpcMetrics metrics_;
     std::atomic<bool> shutting_down_{false};
     std::unique_ptr<ZkClient> zk_client_;
     std::mutex discovery_mutex_;
     std::unordered_map<std::string, EndpointCacheEntry> endpoint_cache_;
 
-    void SendFrame(Endpoint endpoint, std::string frame);
+    void SendFrame(Endpoint endpoint, OutboundFrame frame);
 
-    void SendFrameInLoop(Endpoint endpoint, std::string frame);
+    void SendFrameInLoop(Endpoint endpoint, OutboundFrame frame);
+
+    void PropagateCancellation(const std::shared_ptr<CallState>& state);
+    void PropagateCancellationInLoop(
+        const std::string& endpoint_key,
+        uint64_t request_id,
+        bool request_was_sent);
+
+    static std::string BuildCancelFrame(uint64_t request_id);
 
     ClientSession* GetOrCreateSession(const Endpoint& endpoint);
 

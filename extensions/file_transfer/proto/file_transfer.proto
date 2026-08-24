@@ -15,6 +15,7 @@ enum FileErrorCode {
     INVALID_STATE = 7;
     CHUNK_CONFLICT = 8;
     SERVER_BUSY = 9;
+    FILE_CANCELLED = 10;
 }
 
 message FileResult{

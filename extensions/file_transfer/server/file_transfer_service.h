@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <mutex>
@@ -19,6 +20,13 @@ struct ServiceTaskStats
     uint64_t accepted = 0;
     uint64_t rejected = 0;
     uint64_t completed = 0;
+    uint64_t current_outstanding = 0;
+    uint64_t peak_outstanding = 0;
+    uint64_t cancelled = 0;
+    uint64_t crc_failure = 0;
+    uint64_t session_conflict = 0;
+    uint64_t duplicate_chunk = 0;
+    uint64_t bytes_transferred = 0;
 };
 
 // Protobuf 文件服务实现，将磁盘操作投递到有界工作线程池。
@@ -81,6 +89,7 @@ private:
     void ReportCleanupErrors(const CleanupResult& result) const;
     // 非阻塞投递业务任务，过载时立即返回 SERVER_BUSY。
     bool SubmitTask(BoundedExecutor::Task task,
+                    google::protobuf::RpcController* controller,
                     FileResult* response_result,
                     google::protobuf::Closure* done);
 
@@ -93,5 +102,10 @@ private:
     std::condition_variable cleanup_cv_;
     bool stopping_ = false;
     std::thread cleanup_thread_;
+    std::atomic<uint64_t> cancelled_{0};
+    std::atomic<uint64_t> crc_failure_{0};
+    std::atomic<uint64_t> session_conflict_{0};
+    std::atomic<uint64_t> duplicate_chunk_{0};
+    std::atomic<uint64_t> bytes_transferred_{0};
 };
 }

@@ -25,10 +25,43 @@ public:
     {
         uint32_t user_id = request->userid();
 
+        if (user_id == 9998) {
+            if (controller != nullptr) {
+                controller->SetFailed("friend service rejected request");
+            }
+            if (done != nullptr) {
+                done->Run();
+            }
+            return;
+        }
+
         if(user_id == 9999) {
-            std::this_thread::sleep_for(
-                std::chrono::seconds(1)
-            );
+            std::thread(
+                [controller, response, done] {
+                    for (int i = 0; i < 20; ++i) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                        if (controller != nullptr &&
+                            controller->IsCanceled()) {
+                            std::cout << "SERVER_CANCEL_OBSERVED"
+                                      << std::endl;
+                            if (done != nullptr) {
+                                done->Run();
+                            }
+                            return;
+                        }
+                    }
+                    response->add_friends("Li Si");
+                    response->add_friends("Zhao Liu");
+                    auto* result = response->mutable_result();
+                    result->set_errcode(0);
+                    result->set_errmsg("");
+                    if (done != nullptr) {
+                        done->Run();
+                    }
+                })
+                .detach();
+            return;
         }
         if(user_id >= 10000 &&
             user_id < 10010) {

@@ -40,6 +40,32 @@ int main(){
     assert(frame.header.status_code == header.status_code);
     assert(frame.body == body);
 
+    // 控制帧沿用固定协议头，通过 request_id 指向待取消请求。
+    mprpc::MprpcHeader cancel_header;
+    cancel_header.request_id = 42;
+    cancel_header.message_type = mprpc::MprpcMessageType::CANCEL;
+    cancel_header.status_code = mprpc::MprpcErrorCode::CANCELLED;
+    const std::string cancel_encoded =
+        mprpc::MprpcCodec::Encode(cancel_header, {});
+    mprpc::MprpcFrame cancel_frame;
+    size_t cancel_consumed = 0;
+    assert(mprpc::MprpcCodec::Decode(
+               cancel_encoded, &cancel_frame, &cancel_consumed) ==
+           mprpc::DecodeStatus::OK);
+    assert(cancel_consumed == mprpc::MPRPC_HEADER_SIZE);
+    assert(cancel_frame.header.request_id == 42);
+    assert(cancel_frame.header.message_type ==
+           mprpc::MprpcMessageType::CANCEL);
+    assert(cancel_frame.body.empty());
+
+    const std::string invalid_cancel =
+        mprpc::MprpcCodec::Encode(cancel_header, "unexpected");
+    cancel_consumed = 99;
+    assert(mprpc::MprpcCodec::Decode(
+               invalid_cancel, &cancel_frame, &cancel_consumed) ==
+           mprpc::DecodeStatus::BAD_FRAME);
+    assert(cancel_consumed == 0);
+
     // 半包测试
     std::string partial_header = encoded.substr(0, 10);
     mprpc::MprpcFrame partial_frame;

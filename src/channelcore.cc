@@ -28,6 +28,9 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
     RpcCallResult call_result;
     auto state = std::make_shared<CallState>();
     state->completion = std::move(completion);
+    state->method_name = service_name + "/" + method_name;
+    state->started_at = std::chrono::steady_clock::now();
+    metrics_.CallStarted(state->method_name);
 
     uint64_t request_id = next_request_id_.fetch_add(1);
     state->request_id = request_id;
@@ -55,6 +58,9 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
             closed_completion = std::move(state->completion);
         }
         state->phase.store(CallPhase::Completed, std::memory_order_release);
+        metrics_.CallCompleted(
+            state->method_name, call_result.status_code,
+            std::chrono::steady_clock::now() - state->started_at);
         state->cv.notify_all();
         if (closed_completion) {
             closed_completion(state->result);
@@ -90,25 +96,19 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
     // 发送rpc请求)
     if(options.timeout_ms != 0){
         std::weak_ptr<ChannelCore> weak_self = shared_from_this();
-        std::weak_ptr<CallState> weak_state = state;
 
         double timeout_seconds = static_cast<double>(options.timeout_ms) / 1000.0;
 
         muduo::net::TimerId timer_id = loop_->runAfter(
             timeout_seconds,
-            [weak_self, weak_state, request_id](){
+            [weak_self, request_id](){
                 if(auto self = weak_self.lock()){
-                    std::string endpoint_key;
-                    if (auto call_state = weak_state.lock()) {
-                        endpoint_key = call_state->endpoint_key;
-                    }
                     RpcCallResult timeout_result;
                     timeout_result.request_id = request_id;
                     timeout_result.status_code = mprpc::MprpcErrorCode::TIMEOUT;
                     timeout_result.error_msg = "RPC call timeout!";
 
                     self->CompleteCall(request_id, std::move(timeout_result));
-                    self->RetireDisconnectedSession(endpoint_key);
                 }
             });
 
@@ -117,7 +117,12 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
         state->has_timer = true;
     }
 
-    SendFrame(endpoint, std::move(request_frame));
+    OutboundFrame outbound;
+    outbound.request_id = request_id;
+    outbound.message_type = mprpc::MprpcMessageType::REQUEST;
+    outbound.bytes = std::move(request_frame);
+    outbound.state = state;
+    SendFrame(endpoint, std::move(outbound));
 
     return state;
 }
@@ -153,6 +158,11 @@ bool ChannelCore::IsInIoThread() const
     return loop_ != nullptr && loop_->isInLoopThread();
 }
 
+RpcMetricsSnapshot ChannelCore::GetMetricsSnapshot() const
+{
+    return metrics_.Snapshot();
+}
+
 bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
 {
     std::shared_ptr<CallState> state;
@@ -177,6 +187,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
     muduo::net::TimerId timer_id;
     bool cancel_timer = false;
     RpcCompletion completion;
+    const mprpc::MprpcErrorCode completion_code = result.status_code;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->has_timer) {
@@ -195,7 +206,16 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
 
     state->phase.store(CallPhase::Completed, std::memory_order_release);
 
+    metrics_.CallCompleted(
+        state->method_name, completion_code,
+        std::chrono::steady_clock::now() - state->started_at);
+
     state->cv.notify_all();
+
+    if (completion_code == mprpc::MprpcErrorCode::TIMEOUT ||
+        completion_code == mprpc::MprpcErrorCode::CANCELLED) {
+        PropagateCancellation(state);
+    }
 
     if(completion){
         // 执行用户回调时不能持有 pending 或 state 的锁。
@@ -203,6 +223,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
             completion(state->result);
         };
         if (!callback_executor_ || !callback_executor_->TrySubmit(task)) {
+            metrics_.Increment(RpcMetricEvent::CallbackRejected);
             task();
         }
     }
@@ -291,7 +312,7 @@ void ChannelCore::Shutdown()
         callback_executor_->Shutdown(true);
     }
 }
-void ChannelCore::SendFrame(Endpoint endpoint, std::string frame)
+void ChannelCore::SendFrame(Endpoint endpoint, OutboundFrame frame)
 {
     if (shutting_down_.load(std::memory_order_acquire)) {
         return;
@@ -306,15 +327,26 @@ void ChannelCore::SendFrame(Endpoint endpoint, std::string frame)
                      });
 }
 
-void ChannelCore::SendFrameInLoop(Endpoint endpoint, std::string frame)
+void ChannelCore::SendFrameInLoop(Endpoint endpoint, OutboundFrame frame)
 {
     loop_->assertInLoopThread();
+
+    if (frame.message_type == mprpc::MprpcMessageType::REQUEST) {
+        const auto state = frame.state.lock();
+        if (!state || state->phase.load(std::memory_order_acquire) !=
+                          CallPhase::Pending) {
+            return;
+        }
+    }
 
     ClientSession* session = GetOrCreateSession(endpoint);
     auto conn = session->client->connection();
 
     if(conn && conn->connected()){
-        conn->send(frame);
+        conn->send(frame.bytes);
+        if (auto state = frame.state.lock()) {
+            state->request_sent.store(true, std::memory_order_release);
+        }
         return;
     }
 
@@ -325,6 +357,70 @@ void ChannelCore::SendFrameInLoop(Endpoint endpoint, std::string frame)
         session->client->connect();
     }
 
+}
+
+void ChannelCore::PropagateCancellation(
+    const std::shared_ptr<CallState>& state)
+{
+    if (!state || state->endpoint_key.empty() || loop_ == nullptr ||
+        shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const bool request_was_sent =
+        state->request_sent.load(std::memory_order_acquire);
+    std::weak_ptr<ChannelCore> weak_self = shared_from_this();
+    loop_->runInLoop(
+        [weak_self, endpoint_key = state->endpoint_key,
+         request_id = state->request_id, request_was_sent] {
+            if (auto self = weak_self.lock()) {
+                self->PropagateCancellationInLoop(
+                    endpoint_key, request_id, request_was_sent);
+            }
+        });
+}
+
+void ChannelCore::PropagateCancellationInLoop(
+    const std::string& endpoint_key,
+    uint64_t request_id,
+    bool request_was_sent)
+{
+    loop_->assertInLoopThread();
+    const auto it = sessions_.find(endpoint_key);
+    if (it == sessions_.end()) {
+        return;
+    }
+
+    ClientSession& session = *it->second;
+    bool removed_waiting_request = false;
+    for (auto frame = session.waiting_frames.begin();
+         frame != session.waiting_frames.end();) {
+        if (frame->message_type == mprpc::MprpcMessageType::REQUEST &&
+            frame->request_id == request_id) {
+            frame = session.waiting_frames.erase(frame);
+            removed_waiting_request = true;
+        } else {
+            ++frame;
+        }
+    }
+
+    if (removed_waiting_request && !request_was_sent) {
+        return;
+    }
+
+    const auto conn = session.client->connection();
+    if (conn && conn->connected()) {
+        conn->send(BuildCancelFrame(request_id));
+    }
+}
+
+std::string ChannelCore::BuildCancelFrame(uint64_t request_id)
+{
+    mprpc::MprpcHeader header;
+    header.request_id = request_id;
+    header.message_type = mprpc::MprpcMessageType::CANCEL;
+    header.status_code = mprpc::MprpcErrorCode::CANCELLED;
+    return mprpc::MprpcCodec::Encode(header, {});
 }
 
 ChannelCore::ClientSession* ChannelCore::GetOrCreateSession(const Endpoint& endpoint)
@@ -413,8 +509,17 @@ void ChannelCore::OnConnection(const std::string& endpoint_key, const muduo::net
     }
 
     while(!session.waiting_frames.empty()){
-        conn->send(session.waiting_frames.front());
+        OutboundFrame frame = std::move(session.waiting_frames.front());
         session.waiting_frames.pop_front();
+        if (frame.message_type == mprpc::MprpcMessageType::REQUEST) {
+            const auto state = frame.state.lock();
+            if (!state || state->phase.load(std::memory_order_acquire) !=
+                              CallPhase::Pending) {
+                continue;
+            }
+            state->request_sent.store(true, std::memory_order_release);
+        }
+        conn->send(frame.bytes);
     }
 }
 

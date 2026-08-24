@@ -204,6 +204,36 @@ void TestEmptyAndFailures(TestContext& context,
                   "failed write session should be removable");
 }
 
+void TestFinishCancellation(TestContext& context,
+                            const std::filesystem::path& root)
+{
+    UploadSessionManager manager(root);
+    const auto begin = manager.BeginUpload(
+        "cancel-finish.bin", 6,
+        "e9c0f8b575cbfcb42ab3b78ecc87efa3"
+        "b011d9a5d10b09fa4e96f240bf6a82f5",
+        2);
+    context.Check(begin.Ok(), "cancelled finish should begin");
+    if (!begin.Ok()) return;
+
+    Put(manager, begin.transfer_id, 0, "AB");
+    Put(manager, begin.transfer_id, 2, "CD");
+    Put(manager, begin.transfer_id, 4, "EF");
+    const auto session = manager.FindSession(begin.transfer_id);
+    int checks = 0;
+    const auto cancelled = manager.FinishUpload(
+        begin.transfer_id, [&checks] { return ++checks >= 3; });
+    context.Check(cancelled.code == FILE_CANCELLED,
+                  "finish should observe cancellation before publish");
+    context.Check(std::filesystem::exists(session->temporary_path) &&
+                      !std::filesystem::exists(session->final_path),
+                  "cancelled finish must not publish the final file");
+    context.Check(manager.QueryUploadStatus(begin.transfer_id).Ok(),
+                  "cancelled finish should restore the active session");
+    context.Check(manager.FinishUpload(begin.transfer_id).Ok(),
+                  "restored session should remain finishable");
+}
+
 void TestCorruptMetadataAndCleanup(TestContext& context,
                                    const std::filesystem::path& root)
 {
@@ -249,6 +279,7 @@ int main()
     TestConcurrentChunks(context, root / "concurrent");
     TestRecovery(context, root / "recovery");
     TestEmptyAndFailures(context, root / "failures");
+    TestFinishCancellation(context, root / "cancel");
     TestCorruptMetadataAndCleanup(context, root / "cleanup");
 
     std::error_code error;

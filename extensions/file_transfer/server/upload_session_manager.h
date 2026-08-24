@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -97,7 +98,9 @@ public:
     AbortUploadResult AbortUpload(const std::string& transfer_id);
 
     // 校验分片完整性和 SHA-256，随后原子发布最终文件。
-    FinishUploadResult FinishUpload(const std::string& transfer_id);
+    FinishUploadResult FinishUpload(
+        const std::string& transfer_id,
+        std::function<bool()> is_cancelled = {});
 
     std::shared_ptr<UploadSession> FindSession(
         const std::string& transfer_id);

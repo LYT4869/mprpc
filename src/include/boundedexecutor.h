@@ -34,6 +34,8 @@ public:
     uint64_t Accepted() const noexcept;
     uint64_t Rejected() const noexcept;
     uint64_t Completed() const noexcept;
+    uint64_t CurrentOutstanding() const noexcept;
+    uint64_t PeakOutstanding() const noexcept;
 
 private:
     struct State;

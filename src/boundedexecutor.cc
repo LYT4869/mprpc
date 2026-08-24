@@ -15,6 +15,7 @@ struct BoundedExecutor::State
     bool drain = true;
     // 同时统计排队中和正在执行的任务。
     std::size_t outstanding = 0;
+    std::atomic<uint64_t> peak_outstanding{0};
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
     std::atomic<uint64_t> completed{0};
@@ -52,6 +53,11 @@ bool BoundedExecutor::TrySubmit(Task task)
         }
         state_->tasks.push_back(std::move(task));
         ++state_->outstanding;
+        if (state_->outstanding >
+            state_->peak_outstanding.load(std::memory_order_relaxed)) {
+            state_->peak_outstanding.store(
+                state_->outstanding, std::memory_order_relaxed);
+        }
         state_->accepted.fetch_add(1, std::memory_order_relaxed);
     }
     state_->task_cv.notify_one();
@@ -108,6 +114,22 @@ uint64_t BoundedExecutor::Rejected() const noexcept
 uint64_t BoundedExecutor::Completed() const noexcept
 {
     return state_ ? state_->completed.load(std::memory_order_relaxed) : 0;
+}
+
+uint64_t BoundedExecutor::CurrentOutstanding() const noexcept
+{
+    const std::shared_ptr<State> state = state_;
+    if (!state) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->outstanding;
+}
+
+uint64_t BoundedExecutor::PeakOutstanding() const noexcept
+{
+    return state_
+        ? state_->peak_outstanding.load(std::memory_order_relaxed) : 0;
 }
 
 void BoundedExecutor::WorkerLoop(const std::shared_ptr<State>& state)

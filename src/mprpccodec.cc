@@ -131,6 +131,10 @@ DecodeStatus MprpcCodec::Decode(const std::string& input, MprpcFrame* frame, siz
     if(!IsValidMessageType(static_cast<uint16_t>(header.message_type))){
         return DecodeStatus::BAD_FRAME;
     }
+    if (header.message_type == MprpcMessageType::CANCEL &&
+        header.body_len != 0) {
+        return DecodeStatus::BAD_FRAME;
+    }
 
     size_t frame_size = MPRPC_HEADER_SIZE + header.body_len;
     if(input.size() < frame_size){
@@ -186,6 +190,7 @@ DecodeStatus MprpcCodec::DecodeBody(const std::string& input, MprpcBody* decoded
 bool MprpcCodec::IsValidMessageType(uint16_t messageType){
     return messageType == static_cast<uint16_t>(MprpcMessageType::REQUEST) ||
             messageType == static_cast<uint16_t>(MprpcMessageType::RESPONSE) ||
-            messageType == static_cast<uint16_t>(MprpcMessageType::HEARTBEAT);  
+            messageType == static_cast<uint16_t>(MprpcMessageType::HEARTBEAT) ||
+            messageType == static_cast<uint16_t>(MprpcMessageType::CANCEL);
 }
 } // namespace mprpc

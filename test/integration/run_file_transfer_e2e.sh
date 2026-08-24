@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+BUILD_DIR=${BUILD_DIR:-$ROOT_DIR/build}
+BIN_DIR=$BUILD_DIR/bin
 ZK_HOME=${ZK_HOME:-/home/lyt4869/package/apache-zookeeper-3.8.6-bin}
 TEST_ROOT=$(mktemp -d /tmp/mprpc_e2e.XXXXXX)
 CONFIG="$TEST_ROOT/test.conf"
@@ -46,8 +48,14 @@ if ! timeout 1 bash -c '</dev/tcp/127.0.0.1/2181' 2>/dev/null; then
     sleep 2
 fi
 
+# Integration tests own this local service namespace. Remove provider nodes
+# whose ZooKeeper sessions may still be expiring after an interrupted run.
+printf 'deleteall /FileTransferServiceRpc\nquit\n' | \
+    "$ZK_HOME/bin/zkCli.sh" -server 127.0.0.1:2181 \
+    >"$TEST_ROOT/zk-cleanup.log" 2>&1 || true
+
 start_server() {
-    "$ROOT_DIR/bin/file_transfer_server" -i "$CONFIG" \
+    "$BIN_DIR/file_transfer_server" -i "$CONFIG" \
         "$TEST_ROOT/uploads" >"$TEST_ROOT/server.log" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 50); do
@@ -69,7 +77,7 @@ stop_server() {
 }
 
 start_second_server() {
-    "$ROOT_DIR/bin/file_transfer_server" -i "$CONFIG_SECOND" \
+    "$BIN_DIR/file_transfer_server" -i "$CONFIG_SECOND" \
         "$TEST_ROOT/uploads-second" >"$TEST_ROOT/server-second.log" 2>&1 &
     SECOND_SERVER_PID=$!
     for _ in $(seq 1 50); do
@@ -92,19 +100,19 @@ stop_second_server() {
 
 cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build"
 cmake --build "$ROOT_DIR/build" -j2
-"$ROOT_DIR/bin/codec_test"
-"$ROOT_DIR/bin/file_transfer_manager_test"
-"$ROOT_DIR/bin/file_transfer_service_test"
-"$ROOT_DIR/bin/file_transfer_overload_test"
+"$BIN_DIR/codec_test"
+"$BIN_DIR/file_transfer_manager_test"
+"$BIN_DIR/file_transfer_service_test"
+"$BIN_DIR/file_transfer_overload_test"
 
 start_server
 start_second_server
 : >"$TEST_ROOT/empty.bin"
-"$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+"$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --transfer-id 00000000000000000000000000000005 \
     "$TEST_ROOT/empty.bin" affinity-primary.bin \
     >"$TEST_ROOT/affinity-primary.log" 2>&1
-"$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+"$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --transfer-id 00000000000000000000000000000004 \
     "$TEST_ROOT/empty.bin" affinity-second.bin \
     >"$TEST_ROOT/affinity-second.log" 2>&1
@@ -112,7 +120,7 @@ test -f "$TEST_ROOT/uploads/completed/00000000000000000000000000000005_affinity-
 test -f "$TEST_ROOT/uploads-second/completed/00000000000000000000000000000004_affinity-second.bin"
 
 dd if=/dev/urandom of="$TEST_ROOT/happy.bin" bs=1M count=12 status=none
-"$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+"$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --window 8 "$TEST_ROOT/happy.bin" happy.bin \
     >"$TEST_ROOT/happy-client.log" 2>&1
 HAPPY_RESULT=$(find "$TEST_ROOT/uploads" "$TEST_ROOT/uploads-second" \
@@ -126,7 +134,7 @@ sleep 0.2
 # Interrupt a slower transfer after several chunks, then recover from sidecar.
 dd if=/dev/urandom of="$TEST_ROOT/resume.bin" bs=1M count=64 status=none
 set +e
-timeout 15 "$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+timeout 15 "$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --window 1 --chunk-size 262144 --timeout-ms 1000 --max-retries 0 \
     --transfer-id 00000000000000000000000000000001 \
     "$TEST_ROOT/resume.bin" resume.bin \
@@ -160,7 +168,7 @@ TRANSFER_ID=$(sed -n 's/^transfer_id: //p' \
     "$TEST_ROOT/interrupted-client.log" | tail -1)
 test -n "$TRANSFER_ID"
 start_server
-"$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+"$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --window 8 --transfer-id "$TRANSFER_ID" \
     "$TEST_ROOT/resume.bin" resume.bin \
     >"$TEST_ROOT/resumed-client.log" 2>&1
@@ -175,7 +183,7 @@ test "$(sha256sum "$TEST_ROOT/resume.bin" | awk '{print $1}')" = \
 # idempotent even if its original response was lost.
 dd if=/dev/urandom of="$TEST_ROOT/automatic.bin" bs=1M count=32 status=none
 set +e
-timeout 30 "$ROOT_DIR/bin/file_transfer_client" -i "$CONFIG" \
+timeout 30 "$BIN_DIR/file_transfer_client" -i "$CONFIG" \
     --window 1 --chunk-size 262144 --timeout-ms 1000 --max-retries 3 \
     --transfer-id 00000000000000000000000000000003 \
     "$TEST_ROOT/automatic.bin" automatic.bin \
@@ -214,7 +222,7 @@ test "$(sha256sum "$TEST_ROOT/automatic.bin" | awk '{print $1}')" = \
      "$(sha256sum "$AUTOMATIC_RESULT" | awk '{print $1}')"
 
 if [[ ${RUN_BENCHMARK:-0} == 1 ]]; then
-    "$ROOT_DIR/bin/file_transfer_benchmark" -i "$CONFIG" \
+    "$BIN_DIR/file_transfer_benchmark" -i "$CONFIG" \
         "$TEST_ROOT/benchmark" | tee "$TEST_ROOT/benchmark.csv"
 fi
 

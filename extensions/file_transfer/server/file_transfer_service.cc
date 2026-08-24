@@ -47,7 +47,6 @@ void FileTransferServiceImpl::BeginUpload(google::protobuf::RpcController* contr
                     ::mprpc::file::BeginUploadResponse* response,
                     ::google::protobuf::Closure* done)
 {
-    (void)controller;
     // Protobuf request 仅被借用，投递任务前必须复制所需字段。
     std::string file_name = request->file_name();
     uint64_t file_size = request->file_size();
@@ -74,7 +73,7 @@ void FileTransferServiceImpl::BeginUpload(google::protobuf::RpcController* contr
             }
 
             if(done != nullptr) done->Run();
-        }, response->mutable_result(), done
+        }, controller, response->mutable_result(), done
     );
 }
 
@@ -83,7 +82,6 @@ void FileTransferServiceImpl::UploadChunk(google::protobuf::RpcController* contr
                     ::mprpc::file::UploadChunkResponse* response,
                     ::google::protobuf::Closure* done)
 {
-    (void)controller;
     std::string transfer_id = request->transfer_id();
     uint64_t offset = request->offset();
     std::string data(request->data());
@@ -109,6 +107,19 @@ void FileTransferServiceImpl::UploadChunk(google::protobuf::RpcController* contr
                     transfer_id, offset, data, data_crc32);
             }
 
+            if (result.code == CHECKSUM_MISMATCH) {
+                crc_failure_.fetch_add(1, std::memory_order_relaxed);
+            } else if (result.code == CHUNK_CONFLICT) {
+                session_conflict_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (result.duplicate) {
+                duplicate_chunk_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (result.Ok() && !result.duplicate) {
+                bytes_transferred_.fetch_add(
+                    data.size(), std::memory_order_relaxed);
+            }
+
             FillResult(response->mutable_result(), result.code, result.err_msg);
 
             response->set_acknowledged_offset(
@@ -119,7 +130,7 @@ void FileTransferServiceImpl::UploadChunk(google::protobuf::RpcController* contr
             
 
             if(done != nullptr) done->Run();
-        }, response->mutable_result(), done
+        }, controller, response->mutable_result(), done
     );
 }
 
@@ -129,7 +140,6 @@ void FileTransferServiceImpl::QueryUploadStatus(
     ::mprpc::file::QueryUploadStatusResponse* response,
     ::google::protobuf::Closure* done)
 {
-    (void)controller;
     std::string transfer_id = request->transfer_id();
     SubmitTask(
         [this, transfer_id = std::move(transfer_id), response, done] {
@@ -146,7 +156,7 @@ void FileTransferServiceImpl::QueryUploadStatus(
             if (done != nullptr) {
                 done->Run();
             }
-        }, response->mutable_result(), done);
+        }, controller, response->mutable_result(), done);
 }
 
 
@@ -155,22 +165,27 @@ void FileTransferServiceImpl::FinishUpload(google::protobuf::RpcController* cont
                     ::mprpc::file::FinishUploadResponse* response,
                     ::google::protobuf::Closure* done)
 {
-    (void)controller;
     std::string transfer_id = request->transfer_id();
 
     SubmitTask(
         [this,
         transfer_id = std::move(transfer_id),
+        controller,
         response,
         done]{
-            auto result = manager_.FinishUpload(transfer_id);
+            auto result = manager_.FinishUpload(
+                transfer_id,
+                [controller] {
+                    return controller != nullptr &&
+                           controller->IsCanceled();
+                });
 
             FillResult(response->mutable_result(), result.code, result.err_msg);
 
             response->set_received_size(result.received_size);
 
             if(done != nullptr) done->Run();
-        }, response->mutable_result(), done
+        }, controller, response->mutable_result(), done
     );
 }
 
@@ -180,7 +195,6 @@ void FileTransferServiceImpl::AbortUpload(google::protobuf::RpcController* contr
                     ::mprpc::file::AbortUploadResponse* response,
                     ::google::protobuf::Closure* done)
 {
-    (void)controller;
     std::string transfer_id = request->transfer_id();
 
     SubmitTask(
@@ -193,7 +207,7 @@ void FileTransferServiceImpl::AbortUpload(google::protobuf::RpcController* contr
             FillResult(response->mutable_result(), result.code, result.err_msg);
 
             if(done != nullptr) done->Run();
-        }, response->mutable_result(), done
+        }, controller, response->mutable_result(), done
     );
 }
 
@@ -202,14 +216,48 @@ ServiceTaskStats FileTransferServiceImpl::GetTaskStats() const noexcept
     return ServiceTaskStats{
         worker_pool_.Accepted(),
         worker_pool_.Rejected(),
-        worker_pool_.Completed()};
+        worker_pool_.Completed(),
+        worker_pool_.CurrentOutstanding(),
+        worker_pool_.PeakOutstanding(),
+        cancelled_.load(std::memory_order_relaxed),
+        crc_failure_.load(std::memory_order_relaxed),
+        session_conflict_.load(std::memory_order_relaxed),
+        duplicate_chunk_.load(std::memory_order_relaxed),
+        bytes_transferred_.load(std::memory_order_relaxed)};
 }
 
 bool FileTransferServiceImpl::SubmitTask(
-    BoundedExecutor::Task task, FileResult* response_result,
+    BoundedExecutor::Task task,
+    google::protobuf::RpcController* controller,
+    FileResult* response_result,
     google::protobuf::Closure* done)
 {
-    if (worker_pool_.TrySubmit(std::move(task))) {
+    const auto finish_cancelled = [response_result, done] {
+        FillResult(response_result, FILE_CANCELLED,
+                   "file transfer call cancelled");
+        if (done != nullptr) {
+            done->Run();
+        }
+    };
+
+    if (controller != nullptr && controller->IsCanceled()) {
+        cancelled_.fetch_add(1, std::memory_order_relaxed);
+        finish_cancelled();
+        return false;
+    }
+
+    auto cancellable_task =
+        [this, task = std::move(task), controller,
+         finish_cancelled]() mutable {
+            if (controller != nullptr && controller->IsCanceled()) {
+                cancelled_.fetch_add(1, std::memory_order_relaxed);
+                finish_cancelled();
+                return;
+            }
+            task();
+        };
+
+    if (worker_pool_.TrySubmit(std::move(cancellable_task))) {
         return true;
     }
 

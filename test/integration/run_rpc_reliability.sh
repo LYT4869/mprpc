@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+BUILD_DIR=${BUILD_DIR:-$ROOT_DIR/build}
+BIN_DIR=$BUILD_DIR/bin
 ZK_HOME=${ZK_HOME:-/home/lyt4869/package/apache-zookeeper-3.8.6-bin}
 TEST_ROOT=$(mktemp -d /tmp/mprpc_reliability.XXXXXX)
 CONFIG="$TEST_ROOT/test.conf"
@@ -34,7 +36,12 @@ if ! timeout 1 bash -c '</dev/tcp/127.0.0.1/2181' 2>/dev/null; then
     sleep 2
 fi
 
-"$ROOT_DIR/bin/provider" -i "$CONFIG" \
+
+printf 'deleteall /FriendServiceRpc\nquit\n' | \
+    "$ZK_HOME/bin/zkCli.sh" -server 127.0.0.1:2181 \
+    >"$TEST_ROOT/zk-cleanup.log" 2>&1 || true
+
+"$BIN_DIR/provider" -i "$CONFIG" \
     >"$TEST_ROOT/provider.log" 2>&1 &
 PROVIDER_PID=$!
 for _ in $(seq 1 50); do
@@ -48,6 +55,11 @@ if ! timeout 1 bash -c '</dev/tcp/127.0.0.1/18887' 2>/dev/null; then
     exit 1
 fi
 
-timeout 20 "$ROOT_DIR/bin/async_rpc_test" -i "$CONFIG"
-echo "PASS: async, timeout race, cancellation, concurrency and shutdown"
+timeout 20 "$BIN_DIR/async_rpc_test" -i "$CONFIG"
+timeout 5 "$BIN_DIR/provider_deadline_test"
+if ! grep -q "SERVER_CANCEL_OBSERVED" "$TEST_ROOT/provider.log"; then
+    echo "Provider did not observe propagated cancellation" >&2
+    exit 1
+fi
+echo "PASS: async, deadline, cancellation, concurrency and shutdown"
 echo "artifacts: $TEST_ROOT"

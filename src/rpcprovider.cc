@@ -2,11 +2,29 @@
 #include <string>
 #include "mprpcapplication.h"
 #include <functional>
+#include <utility>
 #include <google/protobuf/descriptor.h>
 #include <memory>
 #include "proto/rpc_meta.pb.h"
 #include "mprpccodec.h"
 #include "logger.h"
+
+std::size_t RpcProvider::ActiveCallKeyHash::operator()(
+    const ActiveCallKey& key) const noexcept
+{
+    const std::size_t connection_hash =
+        std::hash<std::string>{}(key.connection_name);
+    const std::size_t request_hash =
+        std::hash<uint64_t>{}(key.request_id);
+    return connection_hash ^ (request_hash + 0x9e3779b9U +
+                              (connection_hash << 6U) +
+                              (connection_hash >> 2U));
+}
+
+RpcMetricsSnapshot RpcProvider::GetMetricsSnapshot() const
+{
+    return metrics_.Snapshot();
+}
 /*
 service_name => service描述；
 service描述 
@@ -88,8 +106,7 @@ void RpcProvider::Run(){
 
 void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn){
     if(!conn->connected()){
-        // 和rpc client断开连接了
-        conn->shutdown();
+        CancelCallsForConnection(conn);
     }
 }
 
@@ -110,52 +127,187 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
         mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::Decode(input, &rpc_frame, &bytes_consumed);  
         if(decode_status == mprpc::DecodeStatus::OK){
             buffer->retrieve(bytes_consumed);
-            HandleRpcFrame(conn, rpc_frame);
+            if (rpc_frame.header.message_type ==
+                mprpc::MprpcMessageType::CANCEL) {
+                HandleCancelFrame(conn, rpc_frame);
+            } else if (rpc_frame.header.message_type ==
+                       mprpc::MprpcMessageType::REQUEST) {
+                HandleRpcFrame(conn, rpc_frame);
+            } else {
+                conn->shutdown();
+                return;
+            }
             continue;
         }
 
         if(decode_status == mprpc::DecodeStatus::NEED_MORE_DATA) break;
 
         std::cout << "Decode rpc frame error" << std::endl;
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         conn->shutdown();
         break;
     }
 }
 
-//closure回调操作，用于序列化rpc的响应和网络发送。
-void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn, RpcResponseContext* context){
+void RpcProvider::OnBusinessDone(
+    std::shared_ptr<RpcResponseContext> context)
+{
+    if (!context || !context->connection) {
+        return;
+    }
+    auto* loop = context->connection->getLoop();
+    loop->queueInLoop([this, context = std::move(context)] {
+        if (context->controller->Failed()) {
+            CompleteServerCallInLoop(
+                context, context->controller->ErrorCode(),
+                context->controller->ErrorText(), true);
+        } else {
+            CompleteServerCallInLoop(
+                context, mprpc::MprpcErrorCode::OK, {}, true);
+        }
+    });
+}
+
+void RpcProvider::CompleteServerCall(
+    const std::shared_ptr<RpcResponseContext>& context,
+    mprpc::MprpcErrorCode code,
+    std::string message,
+    bool send_response)
+{
+    if (!context || !context->connection) {
+        return;
+    }
+    auto* loop = context->connection->getLoop();
+    loop->runInLoop(
+        [this, context, code, message = std::move(message),
+         send_response]() mutable {
+            CompleteServerCallInLoop(
+                context, code, message, send_response);
+        });
+}
+
+void RpcProvider::CompleteServerCallInLoop(
+    const std::shared_ptr<RpcResponseContext>& context,
+    mprpc::MprpcErrorCode code,
+    const std::string& message,
+    bool send_response)
+{
+    context->connection->getLoop()->assertInLoopThread();
+    bool expected = false;
+    if (!context->response_sent.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (context->has_timer) {
+        context->connection->getLoop()->cancel(context->timer_id);
+        context->has_timer = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(active_calls_mutex_);
+        active_calls_.erase(
+            ActiveCallKey{context->connection_name,
+                          context->request_id});
+    }
+
+    const auto elapsed =
+        std::chrono::steady_clock::now() - context->started_at;
+
+    if (!send_response || !context->connection->connected()) {
+        metrics_.CallCompleted(context->method_name, code, elapsed);
+        return;
+    }
+
+    if (code != mprpc::MprpcErrorCode::OK) {
+        metrics_.CallCompleted(context->method_name, code, elapsed);
+        SendRpcErrorResponse(context->connection, context->request_id,
+                             code, message);
+        return;
+    }
+
     std::string response_payload;
-    // response进行序列化
-    if(!context->response->SerializeToString(&response_payload)){
-        std::cout <<"Serialize response_str error!" << std::endl;
-        conn->shutdown();
-        delete context;
+    if (!context->response->SerializeToString(&response_payload)) {
+        metrics_.CallCompleted(
+            context->method_name,
+            mprpc::MprpcErrorCode::SERIALIZE_FAILED, elapsed);
+        SendRpcErrorResponse(
+            context->connection, context->request_id,
+            mprpc::MprpcErrorCode::SERIALIZE_FAILED,
+            "Serialize RPC response failed");
         return;
     }
 
     mprpc::MprpcResponseMeta response_meta;
-    response_meta.set_error_msg("");
     std::string meta;
-    if(!response_meta.SerializeToString(&meta)){
-        std::cout <<"Serialize response_str error!" << std::endl;
-        conn->shutdown();
-        delete context;
+    if (!response_meta.SerializeToString(&meta)) {
+        metrics_.CallCompleted(
+            context->method_name,
+            mprpc::MprpcErrorCode::SERIALIZE_FAILED, elapsed);
+        context->connection->shutdown();
         return;
     }
 
-    std::string body = mprpc::MprpcCodec::EncodeBody(meta, response_payload);
-
+    const std::string body =
+        mprpc::MprpcCodec::EncodeBody(meta, response_payload);
     mprpc::MprpcHeader header;
     header.request_id = context->request_id;
     header.message_type = mprpc::MprpcMessageType::RESPONSE;
     header.status_code = mprpc::MprpcErrorCode::OK;
-    header.checksum = 0;
+    metrics_.CallCompleted(
+        context->method_name, mprpc::MprpcErrorCode::OK, elapsed);
+    context->connection->send(mprpc::MprpcCodec::Encode(header, body));
+}
 
-    std::string frame = mprpc::MprpcCodec::Encode(header, body);
+void RpcProvider::HandleCancelFrame(
+    const muduo::net::TcpConnectionPtr& conn,
+    const mprpc::MprpcFrame& frame)
+{
+    if (!frame.body.empty()) {
+        conn->shutdown();
+        return;
+    }
 
-    conn->send(frame);
+    std::shared_ptr<RpcResponseContext> context;
+    {
+        std::lock_guard<std::mutex> lock(active_calls_mutex_);
+        const auto it = active_calls_.find(
+            ActiveCallKey{conn->name(), frame.header.request_id});
+        if (it == active_calls_.end()) {
+            return;
+        }
+        context = it->second;
+    }
 
-    delete context;
+    context->controller->StartCancel();
+    metrics_.Increment(
+        RpcMetricEvent::ClientCancel, 1, context->method_name);
+    CompleteServerCallInLoop(
+        context, mprpc::MprpcErrorCode::CANCELLED,
+        "RPC call cancelled by client", true);
+}
+
+void RpcProvider::CancelCallsForConnection(
+    const muduo::net::TcpConnectionPtr& conn)
+{
+    std::vector<std::shared_ptr<RpcResponseContext>> calls;
+    {
+        std::lock_guard<std::mutex> lock(active_calls_mutex_);
+        for (const auto& entry : active_calls_) {
+            if (entry.first.connection_name == conn->name()) {
+                calls.push_back(entry.second);
+            }
+        }
+    }
+
+    for (const auto& context : calls) {
+        context->controller->StartCancel();
+        metrics_.Increment(
+            RpcMetricEvent::Disconnect, 1, context->method_name);
+        CompleteServerCallInLoop(
+            context, mprpc::MprpcErrorCode::CONNECTION_CLOSED,
+            "RPC client connection closed", false);
+    }
 }
 
 void RpcProvider::SendRpcErrorResponse(const muduo::net::TcpConnectionPtr& conn, uint64_t request_id, mprpc::MprpcErrorCode error_code, const std::string& err_msg){
@@ -185,12 +337,14 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
     mprpc::MprpcBody rpc_body;
     mprpc::DecodeStatus decode_status = mprpc::MprpcCodec::DecodeBody(frame.body, &rpc_body);
     if(decode_status != mprpc::DecodeStatus::OK){
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::BAD_FRAME, "Decode rpc body error!");
         return;
     }
 
     mprpc::MprpcRequestMeta rpc_meta;
     if(!rpc_meta.ParseFromString(rpc_body.meta)){
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::PARSE_ERROR, "Parse rpc meta error!");
         return;
     }
@@ -200,16 +354,16 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
     const uint32_t timeout_ms = rpc_meta.timeout_ms();
     const std::string& payload = rpc_body.payload;
 
-    (void)timeout_ms;
-
     auto it = m_serviceMap.find(service_name);
     if(it == m_serviceMap.end()){
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::SERVICE_NOT_FOUND, service_name + " does not exist!");
         return;
     }
 
     auto mit = it->second.m_methodMap.find(method_name);
     if(mit == it->second.m_methodMap.end()){
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::METHOD_NOT_FOUND, method_name + " does not exist!");
         return;
     }
@@ -217,27 +371,66 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
     google::protobuf::Service *service = it->second.m_service;
     const google::protobuf::MethodDescriptor *method = mit->second;
 
-    std::unique_ptr<google::protobuf::Message> request(service->GetRequestPrototype(method).New());
-    
-    
+    std::unique_ptr<google::protobuf::Message> request(
+        service->GetRequestPrototype(method).New());
     if(!request->ParseFromString(payload)){
+        metrics_.Increment(RpcMetricEvent::FrameworkError);
         SendRpcErrorResponse(conn, frame.header.request_id, mprpc::MprpcErrorCode::PARSE_ERROR, "Parse request payload error!");
         return;
     }
 
-    auto response = std::unique_ptr<google::protobuf::Message>(service->GetResponsePrototype(method).New());
+    auto context = std::make_shared<RpcResponseContext>();
+    context->request = std::move(request);
+    context->response.reset(service->GetResponsePrototype(method).New());
+    context->controller = std::make_shared<MprpcController>();
+    context->connection = conn;
+    context->connection_name = conn->name();
+    context->method_name = service_name + "/" + method_name;
+    context->request_id = frame.header.request_id;
+    context->started_at = std::chrono::steady_clock::now();
+    metrics_.CallStarted(context->method_name);
 
-    google::protobuf::Message* response_raw = response.get();
+    const ActiveCallKey key{context->connection_name,
+                            context->request_id};
+    {
+        std::lock_guard<std::mutex> lock(active_calls_mutex_);
+        if (!active_calls_.emplace(key, context).second) {
+            metrics_.CallCompleted(
+                context->method_name, mprpc::MprpcErrorCode::BAD_FRAME,
+                std::chrono::steady_clock::now() - context->started_at);
+            SendRpcErrorResponse(
+                conn, frame.header.request_id,
+                mprpc::MprpcErrorCode::BAD_FRAME,
+                "Duplicate active request id on connection");
+            return;
+        }
+    }
 
-    // context 沿完成回调传递，并在响应发送后释放。
-    RpcResponseContext* response_context = new RpcResponseContext{std::move(response), frame.header.request_id};
-    google::protobuf::Closure* done = google::protobuf::NewCallback<RpcProvider, 
-                                                                    muduo::net::TcpConnectionPtr,
-                                                                    RpcResponseContext*>(
-                                                                        this,
-                                                                        &RpcProvider::SendRpcResponse, 
-                                                                        conn, 
-                                                                        response_context
-                                                                    );
-    service->CallMethod(method, nullptr, request.get(), response_raw, done);
+    if (timeout_ms != 0) {
+        const double timeout_seconds =
+            static_cast<double>(timeout_ms) / 1000.0;
+        std::weak_ptr<RpcResponseContext> weak_context = context;
+        context->timer_id = conn->getLoop()->runAfter(
+            timeout_seconds, [this, weak_context] {
+                if (auto active = weak_context.lock()) {
+                    active->controller->StartCancel();
+                    metrics_.Increment(
+                        RpcMetricEvent::DeadlineExceeded, 1,
+                        active->method_name);
+                    CompleteServerCallInLoop(
+                        active, mprpc::MprpcErrorCode::TIMEOUT,
+                        "RPC server deadline exceeded", true);
+                }
+            });
+        context->has_timer = true;
+    }
+
+    google::protobuf::Closure* done =
+        google::protobuf::NewCallback<RpcProvider,
+                                      std::shared_ptr<RpcResponseContext>>(
+            this, &RpcProvider::OnBusinessDone, context);
+
+    service->CallMethod(
+        method, context->controller.get(), context->request.get(),
+        context->response.get(), done);
 }

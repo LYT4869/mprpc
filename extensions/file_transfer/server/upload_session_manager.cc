@@ -466,7 +466,8 @@ QueryUploadStatusResult UploadSessionManager::QueryUploadStatus(
 }
 
 FinishUploadResult UploadSessionManager::FinishUpload(
-    const std::string& transfer_id)
+    const std::string& transfer_id,
+    std::function<bool()> is_cancelled)
 {
     FinishUploadResult result;
     const auto session = FindSession(transfer_id);
@@ -496,6 +497,11 @@ FinishUploadResult UploadSessionManager::FinishUpload(
             result.err_msg = "file has missing chunks";
             return result;
         }
+        if (is_cancelled && is_cancelled()) {
+            result.code = FILE_CANCELLED;
+            result.err_msg = "finish upload cancelled";
+            return result;
+        }
 
         // Finishing 阻止新分片进入，哈希和 rename 可在锁外执行。
         session->state = UploadState::Finishing;
@@ -506,10 +512,21 @@ FinishUploadResult UploadSessionManager::FinishUpload(
                              std::string(std::strerror(errno));
             return result;
         }
-        session->file.Reset();
         temporary_path = session->temporary_path;
         final_path = session->final_path;
         expected_sha256 = session->expected_sha256;
+    }
+
+    const auto restore_after_cancel = [&] {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->state = UploadState::Active;
+        result.code = FILE_CANCELLED;
+        result.err_msg = "finish upload cancelled";
+    };
+
+    if (is_cancelled && is_cancelled()) {
+        restore_after_cancel();
+        return result;
     }
 
     const Sha256Result sha256 = ComputeFileSha256(temporary_path);
@@ -520,6 +537,11 @@ FinishUploadResult UploadSessionManager::FinishUpload(
         result.err_msg = sha256.ok
             ? "file SHA-256 mismatch"
             : "failed to compute SHA-256: " + sha256.error_msg;
+        return result;
+    }
+
+    if (is_cancelled && is_cancelled()) {
+        restore_after_cancel();
         return result;
     }
 
@@ -537,6 +559,7 @@ FinishUploadResult UploadSessionManager::FinishUpload(
     {
         std::lock_guard<std::mutex> lock(session->mutex);
         session->state = UploadState::Completed;
+        session->file.Reset();
     }
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);

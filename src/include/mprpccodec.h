@@ -15,6 +15,7 @@ enum class MprpcMessageType : uint16_t
     REQUEST = 1,
     RESPONSE = 2,
     HEARTBEAT = 3,
+    CANCEL = 4,
 };
 
 enum class MprpcErrorCode : uint16_t

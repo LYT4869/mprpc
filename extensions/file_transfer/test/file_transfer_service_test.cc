@@ -46,6 +46,30 @@ struct CompletionState
     std::thread::id callback_thread;
 };
 
+class TestRpcController : public google::protobuf::RpcController
+{
+public:
+    void Reset() override { cancelled_ = false; failed_ = false; }
+    bool Failed() const override { return failed_; }
+    std::string ErrorText() const override { return error_; }
+    void StartCancel() override { cancelled_ = true; }
+    void SetFailed(const std::string& reason) override
+    {
+        failed_ = true;
+        error_ = reason;
+    }
+    bool IsCanceled() const override { return cancelled_; }
+    void NotifyOnCancel(google::protobuf::Closure* callback) override
+    {
+        if (cancelled_ && callback != nullptr) callback->Run();
+    }
+
+private:
+    bool cancelled_ = false;
+    bool failed_ = false;
+    std::string error_;
+};
+
 void RecordCompletion(std::shared_ptr<CompletionState> state)
 {
     {
@@ -145,6 +169,29 @@ int main()
                       "service startup should remove orphaned part files");
         context.Check(std::filesystem::exists(unrelated_path),
                       "service startup should keep unrelated files");
+
+        {
+            TestRpcController cancelled_controller;
+            cancelled_controller.StartCancel();
+            BeginUploadRequest request;
+            request.set_file_name("cancelled.bin");
+            request.set_file_size(1);
+            request.set_file_sha256(std::string(64, 'a'));
+            BeginUploadResponse response;
+            auto state = std::make_shared<CompletionState>();
+            service.BeginUpload(
+                &cancelled_controller, &request, &response,
+                NewCompletion(state));
+            std::lock_guard<std::mutex> lock(state->mutex);
+            context.Check(state->completed && state->callback_count == 1,
+                          "cancelled request should complete once");
+            context.Check(response.has_result() &&
+                              response.result().code() == FILE_CANCELLED,
+                          "cancelled request should not enter worker queue");
+            context.Check(service.GetTaskStats().accepted == 0 &&
+                              service.GetTaskStats().cancelled == 1,
+                          "cancelled request should update service metrics");
+        }
 
         auto begin_state = std::make_shared<CompletionState>();
         {

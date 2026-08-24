@@ -19,6 +19,8 @@ public:
                         const google::protobuf::Message* request, google::protobuf::Message* response,
                         google::protobuf::Closure* done) override;
 
+    RpcMetricsSnapshot GetMetricsSnapshot() const;
+
 private:
     std::shared_ptr<ChannelCore> core_;
     // 将核心层结果写回 controller/response，并在异步调用中执行 done。

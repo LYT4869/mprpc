@@ -267,6 +267,7 @@ bool TestCancellation(fixbug::FriendServiceRpc_Stub* stub)
                         &context->response, done);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     context->controller.StartCancel();
+    context->controller.StartCancel();
 
     std::unique_lock<std::mutex> lock(context->mutex);
     const bool completed = context->cv.wait_for(
@@ -285,6 +286,61 @@ bool TestCancellation(fixbug::FriendServiceRpc_Stub* stub)
 
     std::cout << (passed ? "PASS" : "FAIL")
               << ": cancellation completes exactly once" << std::endl;
+    return passed;
+}
+
+bool TestBusinessControllerFailure(fixbug::FriendServiceRpc_Stub* stub)
+{
+    fixbug::GetFriendListRequest request;
+    request.set_userid(9998);
+    fixbug::GetFriendListResponse response;
+    MprpcController controller;
+    stub->GetFriendList(&controller, &request, &response, nullptr);
+    const bool passed = controller.Failed() &&
+        controller.ErrorCode() == mprpc::MprpcErrorCode::INTERNAL_ERROR &&
+        controller.ErrorText().find("rejected") != std::string::npos;
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": business controller failure propagation"
+              << std::endl;
+    return passed;
+}
+
+bool TestSameRequestIdOnDifferentConnections()
+{
+    auto first_channel = std::make_unique<MprpcChannel>();
+    auto second_channel = std::make_unique<MprpcChannel>();
+    fixbug::FriendServiceRpc_Stub first_stub(first_channel.get());
+    fixbug::FriendServiceRpc_Stub second_stub(second_channel.get());
+    auto batch = std::make_shared<BatchState>();
+
+    const auto start_call = [&batch](
+        fixbug::FriendServiceRpc_Stub* stub, uint32_t user_id) {
+        auto context = std::make_shared<ConcurrentCallContext>();
+        context->expected_user_id = user_id;
+        context->batch = batch;
+        context->controller.SetTimeoutMs(3000);
+
+        fixbug::GetFriendListRequest request;
+        request.set_userid(user_id);
+        auto* done = google::protobuf::NewCallback(
+            &OnConcurrentDone, context);
+        stub->GetFriendList(&context->controller, &request,
+                            &context->response, done);
+    };
+
+    // 两个新 Channel 都从 request_id=1 开始，但连接身份不同。
+    start_call(&first_stub, 10000);
+    start_call(&second_stub, 10001);
+
+    std::unique_lock<std::mutex> lock(batch->mutex);
+    const bool completed = batch->cv.wait_for(
+        lock, std::chrono::seconds(5), [&batch] {
+            return batch->completed == 2;
+        });
+    const bool passed = completed && batch->failed == 0;
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": same request id on different connections"
+              << std::endl;
     return passed;
 }
 
@@ -319,6 +375,23 @@ bool TestChannelShutdown()
     return passed;
 }
 
+bool TestClientMetrics(const MprpcChannel& channel)
+{
+    const RpcMetricsSnapshot snapshot = channel.GetMetricsSnapshot();
+    const auto& total = snapshot.total;
+    const bool passed = total.started == 14 && total.active == 0 &&
+        total.success == 11 && total.timeout == 1 &&
+        total.cancelled == 1 && total.framework_error == 1 &&
+        total.latency_buckets.back() == total.started;
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": client metrics, started=" << total.started
+              << ", active=" << total.active
+              << ", success=" << total.success
+              << ", timeout=" << total.timeout
+              << ", cancelled=" << total.cancelled << std::endl;
+    return passed;
+}
+
 int main(int argc, char** argv)
 {
     MprpcApplication::Init(argc, argv);
@@ -339,6 +412,14 @@ int main(int argc, char** argv)
     bool cancelled =
         TestCancellation(&stub);
 
+    bool business_failure =
+        TestBusinessControllerFailure(&stub);
+
+    bool metrics = TestClientMetrics(*channel);
+
+    bool connection_scoped_ids =
+        TestSameRequestIdOnDifferentConnections();
+
     bool channel_shutdown =
         TestChannelShutdown();
 
@@ -347,6 +428,9 @@ int main(int argc, char** argv)
         timeout_once &&
         concurrent &&
         cancelled &&
+        business_failure &&
+        metrics &&
+        connection_scoped_ids &&
         channel_shutdown;
 
     return passed ? 0 : 1;
