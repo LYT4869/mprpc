@@ -6,10 +6,17 @@
 
 #include "zookeeperutil.h"
 #include "channelcore.h"
+#include "rpcclientruntime.h"
 #include "proto/rpc_meta.pb.h"
 
 ChannelCore::ChannelCore()
-    : loop_(io_thread_.startLoop()),
+    : ChannelCore(RpcClientRuntime::Default())
+{
+}
+
+ChannelCore::ChannelCore(std::shared_ptr<RpcClientRuntime> runtime)
+    : runtime_(runtime ? std::move(runtime) : RpcClientRuntime::Default()),
+      loop_(runtime_->NextLoop()),
       callback_executor_(std::make_shared<BoundedExecutor>(2, 1024))
 {
 }

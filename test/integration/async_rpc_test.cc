@@ -11,6 +11,7 @@
 #include "mprpcapplication.h"
 #include "mprpcchannel.h"
 #include "mprpccontroller.h"
+#include "rpcclientruntime.h"
 
 struct AsyncContext
 {
@@ -375,6 +376,47 @@ bool TestChannelShutdown()
     return passed;
 }
 
+bool TestSharedRuntimeSurvivesChannelShutdown()
+{
+    auto runtime = std::make_shared<RpcClientRuntime>(1);
+    auto first_channel = std::make_unique<MprpcChannel>(runtime);
+    auto second_channel = std::make_unique<MprpcChannel>(runtime);
+    auto first_stub = std::make_unique<fixbug::FriendServiceRpc_Stub>(
+        first_channel.get());
+    fixbug::FriendServiceRpc_Stub second_stub(second_channel.get());
+
+    fixbug::GetFriendListRequest slow_request;
+    slow_request.set_userid(9999);
+    auto context = std::make_shared<AsyncContext>();
+    context->controller.SetTimeoutMs(5000);
+    auto* done = google::protobuf::NewCallback(&OnAsyncDone, context);
+    first_stub->GetFriendList(
+        &context->controller, &slow_request, &context->response, done);
+
+    first_stub.reset();
+    first_channel.reset();
+
+    fixbug::GetFriendListRequest request;
+    request.set_userid(7);
+    fixbug::GetFriendListResponse response;
+    MprpcController controller;
+    second_stub.GetFriendList(&controller, &request, &response, nullptr);
+
+    std::unique_lock<std::mutex> lock(context->mutex);
+    const bool first_completed = context->cv.wait_for(
+        lock, std::chrono::seconds(1), [&context] {
+            return context->completed;
+        });
+    const bool passed = first_completed && context->callback_count == 1 &&
+        context->controller.Failed() && !controller.Failed() &&
+        response.friends_size() == 2;
+
+    std::cout << (passed ? "PASS" : "FAIL")
+              << ": shared runtime survives one channel shutdown"
+              << std::endl;
+    return passed;
+}
+
 bool TestClientMetrics(const MprpcChannel& channel)
 {
     const RpcMetricsSnapshot snapshot = channel.GetMetricsSnapshot();
@@ -423,6 +465,9 @@ int main(int argc, char** argv)
     bool channel_shutdown =
         TestChannelShutdown();
 
+    bool shared_runtime_shutdown =
+        TestSharedRuntimeSurvivesChannelShutdown();
+
     bool passed =
         returns_immediately &&
         timeout_once &&
@@ -431,7 +476,8 @@ int main(int argc, char** argv)
         business_failure &&
         metrics &&
         connection_scoped_ids &&
-        channel_shutdown;
+        channel_shutdown &&
+        shared_runtime_shutdown;
 
     return passed ? 0 : 1;
 }

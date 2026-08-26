@@ -9,7 +9,6 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
-#include <muduo/net/EventLoopThread.h>
 #include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpClient.h>
 #include <muduo/net/Buffer.h>
@@ -22,6 +21,7 @@
 #include "rpcmetrics.h"
 
 class ZkClient;
+class RpcClientRuntime;
 
 // RPC 核心层产出的字节级调用结果，不依赖 Protobuf 消息类型。
 struct RpcCallResult
@@ -84,6 +84,7 @@ class ChannelCore : public std::enable_shared_from_this<ChannelCore>
 {
 public:
     ChannelCore();
+    explicit ChannelCore(std::shared_ptr<RpcClientRuntime> runtime);
     ~ChannelCore();
 
     ChannelCore(const ChannelCore&) = delete;
@@ -143,7 +144,8 @@ private:
     std::atomic<uint64_t> next_request_id_{1};
     std::unordered_map<uint64_t, std::shared_ptr<CallState>> pending_calls_;
     std::mutex pending_mutex_;
-    muduo::net::EventLoopThread io_thread_;
+    // Runtime 拥有线程；Core 只借用生命周期内固定不变的 loop_。
+    std::shared_ptr<RpcClientRuntime> runtime_;
     muduo::net::EventLoop* loop_ = nullptr;
     // 仅允许在 loop_ 所在线程中增删和读取。
     std::unordered_map<std::string, std::unique_ptr<ClientSession>> sessions_;

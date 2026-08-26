@@ -1,9 +1,15 @@
 #include "mprpcchannel.h"
 #include "mprpccontroller.h"
+#include "rpcclientruntime.h"
 
-MprpcChannel::MprpcChannel() : core_(std::make_shared<ChannelCore>())
+MprpcChannel::MprpcChannel()
+    : MprpcChannel(RpcClientRuntime::Default())
 {
+}
 
+MprpcChannel::MprpcChannel(std::shared_ptr<RpcClientRuntime> runtime)
+    : core_(std::make_shared<ChannelCore>(std::move(runtime)))
+{
 }
 
 MprpcChannel::~MprpcChannel()

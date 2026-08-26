@@ -16,6 +16,9 @@ target_link_libraries(codec_test PRIVATE mprpc)
 add_executable(rpcmetrics_test rpcmetrics_test.cpp)
 target_link_libraries(rpcmetrics_test PRIVATE mprpc)
 
+add_executable(rpcclientruntime_test rpcclientruntime_test.cpp)
+target_link_libraries(rpcclientruntime_test PRIVATE mprpc)
+
 add_executable(provider_deadline_test
     integration/provider_deadline_test.cc
     ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
@@ -26,4 +29,5 @@ target_link_libraries(provider_deadline_test
 if(BUILD_TESTING)
     add_test(NAME codec_test COMMAND codec_test)
     add_test(NAME rpcmetrics_test COMMAND rpcmetrics_test)
+    add_test(NAME rpcclientruntime_test COMMAND rpcclientruntime_test)
 endif()

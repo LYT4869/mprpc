@@ -8,11 +8,14 @@
 #include "mprpccontroller.h"
 #include "channelcore.h"
 
+class RpcClientRuntime;
+
 // Protobuf RpcChannel 适配层，负责消息序列化和同步/异步调用语义。
 class MprpcChannel : public google::protobuf::RpcChannel
 {
 public:
     MprpcChannel();
+    explicit MprpcChannel(std::shared_ptr<RpcClientRuntime> runtime);
     ~MprpcChannel() override;
     // Generated Stub 的统一入口；done 为空表示同步调用，否则为异步调用。
     void CallMethod(const google::protobuf::MethodDescriptor* method, google::protobuf::RpcController* controller,
