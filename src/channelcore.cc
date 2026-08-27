@@ -16,8 +16,7 @@ ChannelCore::ChannelCore()
 
 ChannelCore::ChannelCore(std::shared_ptr<RpcClientRuntime> runtime)
     : runtime_(runtime ? std::move(runtime) : RpcClientRuntime::Default()),
-      loop_(runtime_->NextLoop()),
-      callback_executor_(std::make_shared<BoundedExecutor>(2, 1024))
+      loop_(runtime_->NextLoop())
 {
 }
 
@@ -43,35 +42,45 @@ CallHandle ChannelCore::StartCall(const std::string& service_name,
     state->request_id = request_id;
     call_result.request_id = request_id;
 
+    if (state->completion) {
+        state->callback_reservation = runtime_->TryReserveCallback();
+        if (!state->callback_reservation) {
+            call_result.status_code =
+                mprpc::MprpcErrorCode::CALLBACK_REJECTED;
+            call_result.error_msg = "RPC callback executor is full";
+            RpcCompletion rejected_completion;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->result = call_result;
+                state->completed = true;
+                rejected_completion = std::move(state->completion);
+            }
+            state->phase.store(
+                CallPhase::Completed, std::memory_order_release);
+            metrics_.Increment(
+                RpcMetricEvent::CallbackRejected, 1, state->method_name);
+            metrics_.CallCompleted(
+                state->method_name, call_result.status_code,
+                std::chrono::steady_clock::now() - state->started_at);
+            state->cv.notify_all();
+            // 入场失败发生在调用线程，尚未进入 Reactor 或网络层。
+            rejected_completion(state->result);
+            return state;
+        }
+    }
+
     bool channel_closed = false;
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        if (shutting_down_.load(std::memory_order_acquire)) {
-            channel_closed = true;
-        } else {
-            // 必须先注册再发送，避免快速响应找不到调用状态。
-            pending_calls_[request_id] = state;
-        }
+        channel_closed = shutting_down_.load(std::memory_order_acquire);
+        // 必须先注册再发送，避免快速响应找不到调用状态。
+        pending_calls_[request_id] = state;
     }
 
     if (channel_closed) {
         call_result.status_code = mprpc::MprpcErrorCode::CHANNEL_CLOSED;
         call_result.error_msg = "RPC channel is closed";
-        RpcCompletion closed_completion;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->result = call_result;
-            state->completed = true;
-            closed_completion = std::move(state->completion);
-        }
-        state->phase.store(CallPhase::Completed, std::memory_order_release);
-        metrics_.CallCompleted(
-            state->method_name, call_result.status_code,
-            std::chrono::steady_clock::now() - state->started_at);
-        state->cv.notify_all();
-        if (closed_completion) {
-            closed_completion(state->result);
-        }
+        CompleteCall(request_id, std::move(call_result));
         return state;
     }
 
@@ -194,6 +203,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
     muduo::net::TimerId timer_id;
     bool cancel_timer = false;
     RpcCompletion completion;
+    BoundedExecutor::Reservation callback_reservation;
     const mprpc::MprpcErrorCode completion_code = result.status_code;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -205,6 +215,7 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
         state->result = std::move(result);
         state->completed = true;
         completion = std::move(state->completion);
+        callback_reservation = std::move(state->callback_reservation);
     }
 
     if (cancel_timer && loop_ != nullptr) {
@@ -229,9 +240,11 @@ bool ChannelCore::CompleteCall(uint64_t request_id, RpcCallResult result)
         auto task = [state, completion = std::move(completion)]() mutable {
             completion(state->result);
         };
-        if (!callback_executor_ || !callback_executor_->TrySubmit(task)) {
+        if (!runtime_->SubmitCallback(
+                std::move(callback_reservation), std::move(task))) {
+            // 有 Reservation 却无法提交表示内部生命周期不变量被破坏。
             metrics_.Increment(RpcMetricEvent::CallbackRejected);
-            task();
+            std::terminate();
         }
     }
 
@@ -313,10 +326,6 @@ void ChannelCore::Shutdown()
             });
             done.wait();
         }
-    }
-
-    if (callback_executor_) {
-        callback_executor_->Shutdown(true);
     }
 }
 void ChannelCore::SendFrame(Endpoint endpoint, OutboundFrame frame)

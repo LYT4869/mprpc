@@ -50,6 +50,7 @@ enum class MprpcErrorCode : uint16_t
     INTERNAL_ERROR = 1401,
     IO_THREAD_BLOCKING_CALL = 1402,
     SERVER_BUSY = 1403,
+    CALLBACK_REJECTED = 1404,
 };
 
 enum class DecodeStatus

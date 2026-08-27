@@ -21,6 +21,52 @@ struct BoundedExecutor::State
     std::atomic<uint64_t> completed{0};
 };
 
+BoundedExecutor::Reservation::Reservation(std::shared_ptr<State> state)
+    : state_(std::move(state))
+{
+}
+
+BoundedExecutor::Reservation::Reservation(Reservation&& other) noexcept
+    : state_(std::move(other.state_))
+{
+}
+
+BoundedExecutor::Reservation&
+BoundedExecutor::Reservation::operator=(Reservation&& other) noexcept
+{
+    if (this != &other) {
+        Release();
+        state_ = std::move(other.state_);
+    }
+    return *this;
+}
+
+BoundedExecutor::Reservation::~Reservation()
+{
+    Release();
+}
+
+BoundedExecutor::Reservation::operator bool() const noexcept
+{
+    return state_ != nullptr;
+}
+
+void BoundedExecutor::Reservation::Release() noexcept
+{
+    std::shared_ptr<State> state = std::move(state_);
+    if (!state) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->outstanding > 0) {
+            --state->outstanding;
+        }
+    }
+    state->task_cv.notify_all();
+}
+
 BoundedExecutor::BoundedExecutor(std::size_t thread_count,
                                  std::size_t max_outstanding)
     : state_(std::make_shared<State>(
@@ -61,6 +107,52 @@ bool BoundedExecutor::TrySubmit(Task task)
         state_->accepted.fetch_add(1, std::memory_order_relaxed);
     }
     state_->task_cv.notify_one();
+    return true;
+}
+
+BoundedExecutor::Reservation BoundedExecutor::TryReserve()
+{
+    const std::shared_ptr<State> state = state_;
+    if (!state) {
+        return {};
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping ||
+            state->outstanding >= state->max_outstanding) {
+            state->rejected.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        ++state->outstanding;
+        if (state->outstanding >
+            state->peak_outstanding.load(std::memory_order_relaxed)) {
+            state->peak_outstanding.store(
+                state->outstanding, std::memory_order_relaxed);
+        }
+    }
+    return Reservation(state);
+}
+
+bool BoundedExecutor::SubmitReserved(Reservation reservation, Task task)
+{
+    if (!task || !reservation.state_ ||
+        reservation.state_ != state_) {
+        return false;
+    }
+
+    const std::shared_ptr<State> state = reservation.state_;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping) {
+            return false;
+        }
+        state->tasks.push_back(std::move(task));
+        state->accepted.fetch_add(1, std::memory_order_relaxed);
+        // outstanding 已在 TryReserve() 中增加，解除 RAII 归还责任。
+        reservation.state_.reset();
+    }
+    state->task_cv.notify_one();
     return true;
 }
 

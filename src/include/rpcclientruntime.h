@@ -7,6 +7,8 @@
 
 #include <muduo/net/EventLoopThread.h>
 
+#include "boundedexecutor.h"
+
 namespace muduo::net
 {
 class EventLoop;
@@ -16,7 +18,9 @@ class EventLoop;
 class RpcClientRuntime
 {
 public:
-    explicit RpcClientRuntime(std::size_t io_thread_count = 2);
+    explicit RpcClientRuntime(std::size_t io_thread_count = 2,
+                              std::size_t callback_thread_count = 2,
+                              std::size_t callback_capacity = 1024);
     ~RpcClientRuntime();
 
     RpcClientRuntime(const RpcClientRuntime&) = delete;
@@ -28,7 +32,14 @@ public:
     muduo::net::EventLoop* NextLoop() noexcept;
     std::size_t IoThreadCount() const noexcept;
 
+    // 异步 RPC 在发送前预留回调容量，保证完成时能够投递。
+    BoundedExecutor::Reservation TryReserveCallback();
+    bool SubmitCallback(BoundedExecutor::Reservation reservation,
+                        BoundedExecutor::Task task);
+
 private:
+    // 声明在 I/O 线程之前，使析构时最后排空回调任务。
+    std::shared_ptr<BoundedExecutor> callback_executor_;
     std::vector<std::unique_ptr<muduo::net::EventLoopThread>> threads_;
     std::vector<muduo::net::EventLoop*> loops_;
     std::atomic<std::size_t> next_loop_{0};

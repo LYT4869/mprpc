@@ -75,7 +75,7 @@ struct CallState
     muduo::net::TimerId timer_id;
 
     RpcCompletion completion;
-    
+    BoundedExecutor::Reservation callback_reservation;
 };
 
 using CallHandle = std::shared_ptr<CallState>;
@@ -102,7 +102,7 @@ public:
     // 通过 request_id 取消仍处于 pending 的调用。
     bool CancelCall(uint64_t request_id);
 
-    // 停止网络与回调执行器，并完成所有剩余调用。
+    // 停止本 Core 的网络资源，并完成所有剩余调用。
     void Shutdown();
     bool IsInIoThread() const;
     RpcMetricsSnapshot GetMetricsSnapshot() const;
@@ -149,7 +149,6 @@ private:
     muduo::net::EventLoop* loop_ = nullptr;
     // 仅允许在 loop_ 所在线程中增删和读取。
     std::unordered_map<std::string, std::unique_ptr<ClientSession>> sessions_;
-    std::shared_ptr<BoundedExecutor> callback_executor_;
     RpcMetrics metrics_;
     std::atomic<bool> shutting_down_{false};
     std::unique_ptr<ZkClient> zk_client_;
