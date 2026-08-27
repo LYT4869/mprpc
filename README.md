@@ -16,13 +16,19 @@ MprpcChannel                 Protobuf 参数适配、同步/异步语义
 ChannelCore + CallState      request_id、pending、timer、取消、一次完成
         |
         v
+RpcClientRuntime             共享 EventLoop 池、共享回调执行器
+        |
+        v
 Muduo EventLoop + TcpClient  endpoint 长连接、收发、半包/粘包处理
         |
         v
-RpcProvider                  解码、服务分发、响应编码
+RpcProvider Reactor          解码、活动调用、deadline、响应编码
         |
         v
-FileTransferService          有界任务队列、SessionManager、磁盘 I/O
+Provider Business Executor   有界排队、业务方法分发
+        |
+        v
+FileTransfer Executor        文件任务限流、SessionManager、磁盘 I/O
 ```
 
 核心原则：同步和异步共用协议、连接、请求编号、响应分发、超时和错误处理；差别
@@ -55,7 +61,13 @@ Decoder 在 Buffer 中循环拆帧：数据不足返回 `NEED_MORE_DATA`，完�
 3. 注册超时 TimerId，通过 ZooKeeper 缓存选择 endpoint，然后复用 TcpClient。
 4. 响应、超时、取消、断线和 Channel 关闭都竞争调用 `CompleteCall`。
 5. `CallPhase` 的 CAS 保证请求只完成一次；完成时摘除 pending 并取消 TimerId。
-6. 同步调用唤醒等待线程；异步回调投递到有界 callback executor，不阻塞 IO 线程。
+6. 同步调用唤醒等待线程；异步调用使用发送前预留的容量投递用户回调，不阻塞 IO 线程。
+
+进程级 `RpcClientRuntime` 默认维护 2 个 EventLoop，并以轮询方式将新 `ChannelCore`
+固定到其中一个 loop。一个 loop 可以管理多个 Core 的连接，但每个 Core 的 session 始终
+由同一 loop 访问。Runtime 还统一持有 2 个回调线程和 1024 个完成槽位；异步调用在
+访问服务发现和网络前预留一个槽位，容量不足立即返回 `CALLBACK_REJECTED`。因此已接收
+调用完成时必然可投递回调，不会因队列饱和退回 Reactor 线程执行用户代码。
 
 客户端超时或主动取消时，会先在本地竞争一次完成权，再沿原连接尽力发送空 body 的
 `CANCEL` 帧。Provider 以“连接身份 + request ID”索引活动调用，并使用相对
@@ -121,9 +133,14 @@ ParallelFileUploader 在 Begin 后查询 bitmap，只调度缺失分片，同时
 
 ## Overload Protection
 
-文件服务默认 4 个 worker、最多 32 个 outstanding（执行中加排队中）。`TrySubmit`
-失败时立即返回 `SERVER_BUSY`，不会阻塞 RpcProvider 的 IO 线程。执行器支持排空关闭，
-并记录 accepted/rejected/completed、当前 outstanding 和峰值水位。
+Provider 默认使用 4 个业务 worker、最多 64 个 outstanding。Muduo IO 线程只负责拆帧、
+活动调用和非阻塞投递；业务方法在线程池执行，队列满立即返回 `SERVER_BUSY`。排队请求若
+先超时或被取消，会通过 `Queued -> Cancelled` 状态转换阻止后续业务执行。
+
+文件服务保留第二级执行器，默认 4 个 worker、最多 32 个 outstanding，用于单独限制磁盘、
+哈希和文件任务压力。两级池职责不同：Provider 池隔离任意业务入口，文件池控制重资源业务
+容量。客户端共享回调执行器则使用发送前容量预留，满载时返回 `CALLBACK_REJECTED`。
+所有队列都非阻塞拒绝，并记录 accepted/rejected/completed、当前 outstanding 和峰值水位。
 
 ## Observability
 

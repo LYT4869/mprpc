@@ -98,8 +98,8 @@ stop_second_server() {
     fi
 }
 
-cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build"
-cmake --build "$ROOT_DIR/build" -j2
+cmake -S "$ROOT_DIR" -B "$BUILD_DIR"
+cmake --build "$BUILD_DIR" -j2
 "$BIN_DIR/codec_test"
 "$BIN_DIR/file_transfer_manager_test"
 "$BIN_DIR/file_transfer_service_test"

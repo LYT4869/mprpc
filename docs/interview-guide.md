@@ -6,7 +6,7 @@
 ## 简历描述
 
 - 基于 C++17、Muduo、Protobuf 和 ZooKeeper 实现 RPC 框架，设计 28 字节固定协议头，支持半包/粘包拆帧、request ID 并发关联、CRC32 校验和长连接复用。
-- 统一同步与异步调用链，通过 `CallState + pending_calls` 管理超时、取消、断线和 Channel 关闭竞争，使用 CAS 保证请求只完成一次，并将用户回调隔离到有界执行器。
+- 统一同步与异步调用链，通过 `CallState + pending_calls` 管理超时、取消、断线和 Channel 关闭竞争，使用 CAS 保证请求只完成一次；以进程级 Runtime 共享少量 Reactor 与回调线程，并在异步发送前预留回调容量。
 - 设计 CANCEL 控制帧和服务端 deadline，以“连接身份 + request ID”管理活动调用，实现客户端到 Provider 的协作式取消传播和迟到完成抑制。
 - 实现大文件上传服务，使用 `ftruncate + pwrite + 分片位图` 支持乱序并发上传，通过分片 CRC32、内容比对和 SHA-256 实现幂等重试及端到端完整性校验。
 - 使用 Protobuf sidecar 和原子 rename 实现进程重启恢复；客户端以滑动窗口并发发送缺失分片，对可恢复网络错误进行指数退避重试。
@@ -18,9 +18,10 @@
 |---|---|
 | 协议编码、拆帧、CRC | `src/mprpccodec.cc`, `src/include/mprpccodec.h` |
 | 请求状态、超时、断线 | `src/channelcore.cc`, `src/include/channelcore.h` |
+| 客户端共享 IO 与回调运行时 | `src/rpcclientruntime.cc`, `src/include/rpcclientruntime.h` |
 | Protobuf 同步/异步适配 | `src/mprpcchannel.cc` |
 | 取消和错误语义 | `src/mprpccontroller.cc` |
-| Provider 分发、deadline、活动调用 | `src/rpcprovider.cc` |
+| Provider 分发、deadline、业务隔离 | `src/rpcprovider.cc`, `src/include/rpcdispatchstate.h` |
 | RPC 指标与 reporter | `src/rpcmetrics.cc`, `src/include/rpcmetrics.h` |
 | ZooKeeper 服务发现 | `src/zookeeperutil.cc` |
 | 有界执行器 | `src/boundedexecutor.cc` |
@@ -64,6 +65,10 @@
 
 11. **为什么用户回调不直接跑在 IO 线程？**
     回调可能阻塞或再次发 RPC，直接执行会拖住 Reactor，严重时造成自锁。
+
+    项目让多个 Channel 共享进程级回调池，并在异步请求发送前预留完成槽位。容量不足时
+    在调用线程立即返回 `CALLBACK_REJECTED`；已接收请求完成后不再进行第二次容量竞争，
+    因而不会出现“队列满后退回 IO 线程执行”的隐蔽阻塞。
 
 12. **Protobuf 异步参数由谁管理生命周期？**
     原生 CallMethod 只借用 controller/response/done；调用方要保证它们活到 done。安全上传器用共享上下文替用户管理。
@@ -120,6 +125,10 @@
 
 28. **有界队列保护了什么？**
     它限制执行中加排队任务的内存和延迟，饱和时快速返回 `SERVER_BUSY`，避免 IO 线程被阻塞等待空间。
+
+    Provider 业务池先把任意业务入口与 Reactor 隔离；文件服务的第二级池再限制磁盘、哈希
+    等重任务。排队调用若先超时或取消，原子状态机阻止 worker 继续进入业务方法。客户端
+    回调池使用预留而不是完成时拒绝，因为已经发出的 RPC 必须保证最终通知调用方。
 
 29. **P50/P95/P99 分别说明什么？**
     P50 表示典型延迟，P95/P99 观察尾延迟；样本少时高分位不稳定，所以项目原始结果明确标注环境和样本数。
