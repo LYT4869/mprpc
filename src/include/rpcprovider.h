@@ -15,7 +15,10 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include "boundedexecutor.h"
 #include "mprpccontroller.h"
+#include "rpcdispatchstate.h"
 #include "rpcmetrics.h"
 #include "zookeeperutil.h" 
 
@@ -23,6 +26,10 @@
 class RpcProvider
 {
 public:
+    RpcProvider();
+    RpcProvider(std::size_t business_threads,
+                std::size_t max_business_outstanding,
+                int io_threads);
     // 注册一个 Protobuf Service 及其全部方法描述符。
     void NotifyService(google::protobuf::Service *service);
 
@@ -50,6 +57,7 @@ private:
         std::string method_name;
         uint64_t request_id;
         std::atomic<bool> response_sent{false};
+        RpcDispatchState dispatch_state;
         bool has_timer = false;
         muduo::net::TimerId timer_id;
         std::chrono::steady_clock::time_point started_at =
@@ -78,6 +86,8 @@ private:
                        std::shared_ptr<RpcResponseContext>,
                        ActiveCallKeyHash> active_calls_;
     RpcMetrics metrics_;
+    BoundedExecutor business_executor_;
+    int io_thread_count_ = 4;
     // 处理连接状态变化。
     void OnConnection(const muduo::net::TcpConnectionPtr&);
 

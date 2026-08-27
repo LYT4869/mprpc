@@ -19,6 +19,9 @@ target_link_libraries(rpcmetrics_test PRIVATE mprpc)
 add_executable(rpcclientruntime_test rpcclientruntime_test.cpp)
 target_link_libraries(rpcclientruntime_test PRIVATE mprpc)
 
+add_executable(rpcdispatchstate_test rpcdispatchstate_test.cpp)
+target_link_libraries(rpcdispatchstate_test PRIVATE mprpc)
+
 add_executable(provider_deadline_test
     integration/provider_deadline_test.cc
     ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
@@ -26,8 +29,16 @@ add_executable(provider_deadline_test
 target_link_libraries(provider_deadline_test
     PRIVATE mprpc protobuf pthread)
 
+add_executable(provider_executor_test
+    integration/provider_executor_test.cc
+    ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
+)
+target_link_libraries(provider_executor_test
+    PRIVATE mprpc protobuf pthread)
+
 if(BUILD_TESTING)
     add_test(NAME codec_test COMMAND codec_test)
     add_test(NAME rpcmetrics_test COMMAND rpcmetrics_test)
     add_test(NAME rpcclientruntime_test COMMAND rpcclientruntime_test)
+    add_test(NAME rpcdispatchstate_test COMMAND rpcdispatchstate_test)
 endif()

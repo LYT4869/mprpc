@@ -1,4 +1,5 @@
 #include "rpcprovider.h"
+#include <algorithm>
 #include <string>
 #include "mprpcapplication.h"
 #include <functional>
@@ -8,6 +9,44 @@
 #include "proto/rpc_meta.pb.h"
 #include "mprpccodec.h"
 #include "logger.h"
+
+namespace
+{
+std::size_t LoadPositiveSetting(const std::string& key,
+                                std::size_t fallback)
+{
+    const std::string text =
+        MprpcApplication::GetInstance().GetConfig().Load(key);
+    if (text.empty()) {
+        return fallback;
+    }
+    try {
+        const unsigned long long parsed = std::stoull(text);
+        return parsed == 0 ? fallback : static_cast<std::size_t>(parsed);
+    } catch (...) {
+        return fallback;
+    }
+}
+} // namespace
+
+RpcProvider::RpcProvider()
+    : RpcProvider(
+          LoadPositiveSetting("rpcproviderbusinessworkers", 4),
+          LoadPositiveSetting("rpcproviderbusinesscapacity", 64),
+          static_cast<int>(
+              LoadPositiveSetting("rpcprovideriothreads", 4)))
+{
+}
+
+RpcProvider::RpcProvider(std::size_t business_threads,
+                         std::size_t max_business_outstanding,
+                         int io_threads)
+    : business_executor_(std::max<std::size_t>(1, business_threads),
+                         std::max<std::size_t>(1,
+                                               max_business_outstanding)),
+      io_thread_count_(std::max(1, io_threads))
+{
+}
 
 std::size_t RpcProvider::ActiveCallKeyHash::operator()(
     const ActiveCallKey& key) const noexcept
@@ -71,7 +110,7 @@ void RpcProvider::Run(){
     server.setMessageCallback(std::bind(&RpcProvider::OnMessage, this, std::placeholders::_1, 
             std::placeholders::_2, std::placeholders::_3));
     //设置muduo库的线程数量
-    server.setThreadNum(4);
+    server.setThreadNum(io_thread_count_);
 
     // 把当前rpc节点上要发布的服务全部注册到zk上面，让rpc client可以从zk上发现服务
     // session timeout 30s   zkclient API 网络IO线程 1/3 * timeout 时间发送ping消息（心跳消息）   
@@ -155,6 +194,7 @@ void RpcProvider::OnBusinessDone(
     if (!context || !context->connection) {
         return;
     }
+    context->dispatch_state.Finish();
     auto* loop = context->connection->getLoop();
     loop->queueInLoop([this, context = std::move(context)] {
         if (context->controller->Failed()) {
@@ -280,6 +320,7 @@ void RpcProvider::HandleCancelFrame(
     }
 
     context->controller->StartCancel();
+    context->dispatch_state.CancelQueued();
     metrics_.Increment(
         RpcMetricEvent::ClientCancel, 1, context->method_name);
     CompleteServerCallInLoop(
@@ -302,6 +343,7 @@ void RpcProvider::CancelCallsForConnection(
 
     for (const auto& context : calls) {
         context->controller->StartCancel();
+        context->dispatch_state.CancelQueued();
         metrics_.Increment(
             RpcMetricEvent::Disconnect, 1, context->method_name);
         CompleteServerCallInLoop(
@@ -414,6 +456,7 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
             timeout_seconds, [this, weak_context] {
                 if (auto active = weak_context.lock()) {
                     active->controller->StartCancel();
+                    active->dispatch_state.CancelQueued();
                     metrics_.Increment(
                         RpcMetricEvent::DeadlineExceeded, 1,
                         active->method_name);
@@ -425,12 +468,31 @@ void RpcProvider::HandleRpcFrame(const muduo::net::TcpConnectionPtr& conn, const
         context->has_timer = true;
     }
 
-    google::protobuf::Closure* done =
-        google::protobuf::NewCallback<RpcProvider,
-                                      std::shared_ptr<RpcResponseContext>>(
-            this, &RpcProvider::OnBusinessDone, context);
+    auto business_task = [this, context, service, method] {
+        if (!context->dispatch_state.TryStart()) {
+            return;
+        }
+        if (context->controller->IsCanceled()) {
+            context->dispatch_state.Finish();
+            return;
+        }
 
-    service->CallMethod(
-        method, context->controller.get(), context->request.get(),
-        context->response.get(), done);
+        google::protobuf::Closure* done =
+            google::protobuf::NewCallback<
+                RpcProvider, std::shared_ptr<RpcResponseContext>>(
+                this, &RpcProvider::OnBusinessDone, context);
+
+        service->CallMethod(
+            method, context->controller.get(), context->request.get(),
+            context->response.get(), done);
+    };
+
+    if (!business_executor_.TrySubmit(std::move(business_task))) {
+        context->dispatch_state.CancelQueued();
+        metrics_.Increment(
+            RpcMetricEvent::QueueRejected, 1, context->method_name);
+        CompleteServerCallInLoop(
+            context, mprpc::MprpcErrorCode::SERVER_BUSY,
+            "RPC business queue is full", true);
+    }
 }

@@ -85,6 +85,13 @@ public:
                     .detach();
                 return;
             }
+        if (user_id == 20000) {
+            std::cout << "BUSINESS_BLOCKER_EXECUTED" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (user_id == 20001) {
+            std::cout << "QUEUED_BUSINESS_EXECUTED" << std::endl;
+        }
         std::vector<std::string> friendList = GetFriendList(user_id);
         for(int i = 0; i < friendList.size(); i++){
             response->add_friends(friendList[i]);
