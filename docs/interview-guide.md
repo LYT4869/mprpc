@@ -2,6 +2,8 @@
 
 本文件用于快速复习。完整的分块问题、参考回答、追问链和八股延伸见
 [`interview-question-bank.md`](interview-question-bank.md)。
+真实测试数据、性能趋势和面试解读见
+[`interview-test-results-2026-08-28.md`](interview-test-results-2026-08-28.md)。
 
 ## 简历描述
 
