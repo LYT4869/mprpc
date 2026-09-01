@@ -47,6 +47,18 @@ add_executable(zk_child_watch_test
 )
 target_link_libraries(zk_child_watch_test PRIVATE mprpc pthread)
 
+add_executable(discovery_provider
+    integration/discovery_provider.cc
+    ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
+)
+target_link_libraries(discovery_provider PRIVATE mprpc protobuf pthread)
+
+add_executable(discovery_watch_test
+    integration/discovery_watch_test.cc
+    ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
+)
+target_link_libraries(discovery_watch_test PRIVATE mprpc protobuf pthread)
+
 if(BUILD_TESTING)
     add_test(NAME codec_test COMMAND codec_test)
     add_test(NAME rpcmetrics_test COMMAND rpcmetrics_test)
