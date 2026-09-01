@@ -42,6 +42,11 @@ add_executable(provider_executor_test
 target_link_libraries(provider_executor_test
     PRIVATE mprpc protobuf pthread)
 
+add_executable(zk_child_watch_test
+    integration/zk_child_watch_test.cc
+)
+target_link_libraries(zk_child_watch_test PRIVATE mprpc pthread)
+
 if(BUILD_TESTING)
     add_test(NAME codec_test COMMAND codec_test)
     add_test(NAME rpcmetrics_test COMMAND rpcmetrics_test)

@@ -11,8 +11,15 @@ ZkClient::ZkClient() : m_zhandle(nullptr)
 
 ZkClient::~ZkClient()
 {
-    zhandle_t* handle = m_zhandle;
-    m_zhandle = nullptr;
+    zhandle_t* handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        children_changed_callback_ = {};
+        session_state_callback_ = {};
+        handle = m_zhandle;
+        m_zhandle = nullptr;
+        connected_ = false;
+    }
     if (handle != nullptr) {
         zookeeper_close(handle);
     }
@@ -25,16 +32,44 @@ void ZkClient::GlobalWatcher(zhandle_t*, int type, int state,
         return;
     }
 
-    // watcher 只发布会话状态，具体 ZK 操作由调用线程完成。
     auto* client = static_cast<ZkClient*>(watcher_context);
+    SessionStateCallback callback;
+    ZkSessionState session_state = ZkSessionState::Disconnected;
     {
         std::lock_guard<std::mutex> lock(client->mutex_);
-        client->connected_ = state == ZOO_CONNECTED_STATE;
+        client->connected_ = state == ZOO_CONNECTED_STATE ||
+                             state == ZOO_READONLY_STATE;
         if (state == ZOO_EXPIRED_SESSION_STATE) {
             client->expired_ = true;
+            session_state = ZkSessionState::Expired;
+        } else if (client->connected_) {
+            session_state = ZkSessionState::Connected;
         }
+        callback = client->session_state_callback_;
     }
     client->connected_cv_.notify_all();
+    if (callback) {
+        callback(session_state);
+    }
+}
+
+void ZkClient::ChildWatcher(zhandle_t*, int type, int,
+                            const char* path, void* watcher_context)
+{
+    if (watcher_context == nullptr || path == nullptr ||
+        (type != ZOO_CHILD_EVENT && type != ZOO_DELETED_EVENT)) {
+        return;
+    }
+
+    auto* client = static_cast<ZkClient*>(watcher_context);
+    ChildrenChangedCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(client->mutex_);
+        callback = client->children_changed_callback_;
+    }
+    if (callback) {
+        callback(path);
+    }
 }
 
 bool ZkClient::Start()
@@ -132,18 +167,10 @@ std::string ZkClient::CreateEphemeralSequential(
 
 std::string ZkClient::GetData(const char* path)
 {
-    if (m_zhandle == nullptr || path == nullptr) {
+    if (path == nullptr) {
         return {};
     }
-
-    std::vector<char> buffer(4096);
-    int length = static_cast<int>(buffer.size());
-    const int result = zoo_get(m_zhandle, path, 0, buffer.data(),
-                               &length, nullptr);
-    if (result != ZOK) {
-        return {};
-    }
-    return std::string(buffer.data(), static_cast<std::size_t>(length));
+    return GetDataResult(path).data;
 }
 
 std::vector<std::string> ZkClient::GetChildren(const std::string& path)
@@ -171,4 +198,59 @@ bool ZkClient::IsConnected() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return connected_;
+}
+
+ZkChildrenResult ZkClient::GetChildrenAndWatch(
+    const std::string& path)
+{
+    ZkChildrenResult result;
+    if (m_zhandle == nullptr) {
+        result.code = ZINVALIDSTATE;
+        return result;
+    }
+
+    String_vector values{};
+    result.code = zoo_wget_children(
+        m_zhandle, path.c_str(), &ZkClient::ChildWatcher, this, &values);
+    if (!result.Ok()) {
+        return result;
+    }
+
+    result.children.reserve(static_cast<std::size_t>(values.count));
+    for (int i = 0; i < values.count; ++i) {
+        result.children.emplace_back(values.data[i]);
+    }
+    deallocate_String_vector(&values);
+    return result;
+}
+
+ZkDataResult ZkClient::GetDataResult(const std::string& path)
+{
+    ZkDataResult result;
+    if (m_zhandle == nullptr) {
+        result.code = ZINVALIDSTATE;
+        return result;
+    }
+
+    std::vector<char> buffer(4096);
+    int length = static_cast<int>(buffer.size());
+    result.code = zoo_get(m_zhandle, path.c_str(), 0, buffer.data(),
+                          &length, nullptr);
+    if (result.Ok()) {
+        result.data.assign(buffer.data(), static_cast<std::size_t>(length));
+    }
+    return result;
+}
+
+void ZkClient::SetChildrenChangedCallback(
+    ChildrenChangedCallback callback)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    children_changed_callback_ = std::move(callback);
+}
+
+void ZkClient::SetSessionStateCallback(SessionStateCallback callback)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    session_state_callback_ = std::move(callback);
 }
