@@ -105,6 +105,11 @@ EventLoop；watcher 线程不读取 ZooKeeper，也不直接持有 Core。下一
 TCP 连接失败淘汰数据面已证实失效的 endpoint。临时节点让 Provider 会话过期后自动
 下线；watch 是刷新提示而不是可靠事件日志。
 
+Provider 由独立注册控制线程维护 ZooKeeper 生命周期。普通 `Disconnected` 由 ZooKeeper
+客户端尝试恢复原 Session，不重复创建节点；收到 `Expired` 后才创建新 Session，重新创建
+持久目录和全部临时顺序 Provider 节点。重注册失败按 100ms 起步、最高 3s 的退避持续重试，
+同步 ZooKeeper 操作不会阻塞 Provider 的 Muduo IO EventLoop。
+
 ## File Upload
 
 默认 chunk 为 1 MiB，最大 4 MiB，滑动窗口为 8。服务端 Begin 阶段使用
@@ -215,6 +220,7 @@ ctest --test-dir build --output-on-failure
 ./test/integration/run_rpc_reliability.sh
 ./test/integration/run_file_transfer_e2e.sh
 ./test/integration/run_zookeeper_watch.sh
+./test/integration/run_provider_reregistration.sh
 ```
 
 RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟到响应竞争、取消和 Channel
@@ -226,6 +232,9 @@ RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟�
 ZooKeeper Watch 脚本先验证 one-shot child watch 必须显式重新注册，再用一个持久 Channel
 依次加入、删除和重启第二个 Provider，要求每次都在 3 秒 TTL 前观察到成员变化，并检查
 watch、refresh 和 active-call 指标。
+
+Provider 重注册脚本使用独立 ZooKeeper 实例：先验证短暂断线不会产生重复节点，再强制旧
+Session 失效，确认不重启 Provider 进程即可恢复注册，并由全新客户端完成 RPC 调用。
 
 ## Benchmark
 

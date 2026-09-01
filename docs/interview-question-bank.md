@@ -557,6 +557,11 @@ Provider 与 ZooKeeper 保持会话和心跳。连接暂时中断时会话未必
 stale，下一次 RPC 重新读取完整列表。同时，TCP 连接断开会主动淘汰本地 endpoint，避免
 必须等待 ZooKeeper 会话超时后才收敛。
 
+Provider 自身也监听会话状态。普通 `Disconnected` 交给 ZooKeeper 客户端恢复原 Session；
+只有收到 `Expired` 才唤醒独立注册线程，创建新 Session 并全量重建服务目录和临时节点。
+失败后封顶退避重试，因此服务进程不会在 Session 过期后永久退出注册中心。同步注册操作不在
+Muduo IO 线程执行。
+
 ## D4. 为什么还需要客户端缓存【P1】
 
 **参考回答：**

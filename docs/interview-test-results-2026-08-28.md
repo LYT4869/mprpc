@@ -145,6 +145,24 @@ ZooKeeper、Muduo RPC、并行分片上传、服务端临时文件、Finish 发�
 - 面试中应把它描述为“一致性与吞吐的明确权衡和后续优化方案”，不能宣称当前实现具有
   生产级 GiB 高吞吐。
 
+## Provider Session Expired 自动重注册
+
+测试使用独立 ZooKeeper 实例和同一个 Provider 进程，覆盖两种状态：
+
+1. 短暂停止并恢复 ZooKeeper，原 Session 保持有效，Provider 节点始终只有一个。
+2. 清除测试实例的会话数据，强制旧 Session Expired；不重启 Provider，等待其建立新 Session
+   并重新创建临时顺序节点。
+
+恢复后启动全新的 RPC 客户端，通过重新出现的注册节点发现原 Provider，并成功完成远程调用。
+这证明 Provider 的“注册 -> Session Expired -> 新会话 -> 重注册”和客户端的
+“Child Watch -> 缓存失效 -> 重新发现”已经形成闭环。
+
+运行命令：
+
+```bash
+./test/integration/run_provider_reregistration.sh
+```
+
 ## 推荐的面试总结
 
 可以用下面这段话概括测试结论：
@@ -163,4 +181,3 @@ ZooKeeper、Muduo RPC、并行分片上传、服务端临时文件、Finish 发�
 - 不把 `SERVER_BUSY` 统计为网络失败；它是有界系统主动负载 shedding。
 - 不把 ASan/UBSan 通过等同于不存在数据竞争。
 - 不隐瞒 1 GiB 吞吐下降，重点说明如何定位、如何优化以及优化会改变什么恢复语义。
-

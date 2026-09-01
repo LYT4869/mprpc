@@ -87,6 +87,8 @@
 15. **ZooKeeper 为什么用临时顺序 Provider 子节点？**
     临时节点随会话消失，顺序节点允许同一方法注册多个实例且名字不冲突。
 
+    普通断线时不创建新 Session；只有 Session Expired、旧临时节点确定失效后，Provider 才由独立注册线程建立新会话并全量重注册，避免阻塞 Reactor。
+
 16. **endpoint 缓存的取舍是什么？**
     缓存减少每次 RPC 的 ZK 开销，但会短暂陈旧；项目用 Child Watch 懒失效，并保留短 TTL、TCP 失败和 ZK 会话事件作为兜底。
 
