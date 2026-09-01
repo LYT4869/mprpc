@@ -21,6 +21,7 @@
 #include "rpcmetrics.h"
 
 class ZkClient;
+enum class ZkSessionState;
 class RpcClientRuntime;
 
 // RPC 核心层产出的字节级调用结果，不依赖 Protobuf 消息类型。
@@ -139,6 +140,7 @@ private:
         std::vector<Endpoint> endpoints;
         std::size_t next_index = 0;
         std::chrono::steady_clock::time_point expires_at;
+        bool stale = false;
     };
 
     std::atomic<uint64_t> next_request_id_{1};
@@ -184,6 +186,10 @@ private:
                         const std::string& message);
     void RetireDisconnectedSession(const std::string& endpoint_key);
     void InvalidateEndpoint(const std::string& endpoint_key);
+    // ZooKeeper 线程只调用这两个入口，将失效操作转交给 EventLoop。
+    void QueueProviderCacheInvalidation(
+        const std::string& providers_path);
+    void QueueSessionCacheInvalidation(ZkSessionState state);
 
     bool BuildRequestFrame(const std::string& service_name,
                             const std::string& method_name,

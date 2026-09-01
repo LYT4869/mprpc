@@ -9,6 +9,25 @@
 #include "rpcclientruntime.h"
 #include "proto/rpc_meta.pb.h"
 
+namespace
+{
+constexpr char kProvidersSuffix[] = "/providers";
+
+bool IsZooKeeperConnectionError(int code)
+{
+    return code == ZCONNECTIONLOSS || code == ZOPERATIONTIMEOUT ||
+           code == ZSESSIONEXPIRED || code == ZINVALIDSTATE ||
+           code == ZCLOSING || code == ZAUTHFAILED;
+}
+
+std::string DiscoveryMetricMethod(const std::string& method_path)
+{
+    return !method_path.empty() && method_path.front() == '/'
+        ? method_path.substr(1)
+        : method_path;
+}
+} // namespace
+
 ChannelCore::ChannelCore()
     : ChannelCore(RpcClientRuntime::Default())
 {
@@ -653,10 +672,14 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
 
     std::lock_guard<std::mutex> lock(discovery_mutex_);
     if (zk_client_ && !zk_client_->IsConnected()) {
-        endpoint_cache_.clear();
+        for (auto& entry : endpoint_cache_) {
+            entry.second.stale = true;
+        }
     }
     auto cached = endpoint_cache_.find(method_path);
     if (cached != endpoint_cache_.end() &&
+        zk_client_ && zk_client_->IsConnected() &&
+        !cached->second.stale &&
         cached->second.expires_at > now &&
         !cached->second.endpoints.empty()) {
         EndpointCacheEntry& entry = cached->second;
@@ -677,19 +700,63 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
 
     if (!zk_client_) {
         zk_client_ = std::make_unique<ZkClient>();
+        std::weak_ptr<ChannelCore> weak_self = weak_from_this();
+        zk_client_->SetChildrenChangedCallback(
+            [weak_self](const std::string& providers_path) {
+                if (auto self = weak_self.lock()) {
+                    self->QueueProviderCacheInvalidation(providers_path);
+                }
+            });
+        zk_client_->SetSessionStateCallback(
+            [weak_self](ZkSessionState state) {
+                if (auto self = weak_self.lock()) {
+                    self->QueueSessionCacheInvalidation(state);
+                }
+            });
     }
     if (!zk_client_->Start()) {
+        metrics_.Increment(RpcMetricEvent::DiscoveryRefreshError, 1,
+                           DiscoveryMetricMethod(method_path));
         *error_msg = "ZooKeeper is unavailable";
         return mprpc::MprpcErrorCode::NETWORK_ERROR;
     }
 
     std::vector<Endpoint> endpoints;
-    const std::vector<std::string> providers =
-        zk_client_->GetChildren(providers_path);
+    const ZkChildrenResult children_result =
+        zk_client_->GetChildrenAndWatch(providers_path);
+    if (!children_result.Ok()) {
+        metrics_.Increment(RpcMetricEvent::DiscoveryRefreshError, 1,
+                           DiscoveryMetricMethod(method_path));
+        if (children_result.code == ZNONODE) {
+            *error_msg = method_path + " has no available provider";
+            return mprpc::MprpcErrorCode::SERVICE_NOT_FOUND;
+        }
+        *error_msg = "ZooKeeper provider lookup failed, code=" +
+                     std::to_string(children_result.code);
+        return IsZooKeeperConnectionError(children_result.code)
+            ? mprpc::MprpcErrorCode::NETWORK_ERROR
+            : mprpc::MprpcErrorCode::INTERNAL_ERROR;
+    }
+    metrics_.Increment(RpcMetricEvent::DiscoveryRefresh, 1,
+                       DiscoveryMetricMethod(method_path));
+
     bool invalid_address = false;
-    for (const std::string& provider : providers) {
-        const std::string host_data =
-            zk_client_->GetData((providers_path + "/" + provider).c_str());
+    bool data_read_failed = false;
+    int data_error_code = ZOK;
+    for (const std::string& provider : children_result.children) {
+        const ZkDataResult data_result = zk_client_->GetDataResult(
+            providers_path + "/" + provider);
+        if (data_result.code == ZNONODE) {
+            // Provider 可在 children 读取后、data 读取前下线。
+            continue;
+        }
+        if (!data_result.Ok()) {
+            data_read_failed = true;
+            data_error_code = data_result.code;
+            continue;
+        }
+
+        const std::string& host_data = data_result.data;
         const std::size_t separator = host_data.rfind(':');
         if (separator == std::string::npos || separator == 0 ||
             separator + 1 >= host_data.size()) {
@@ -712,7 +779,19 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
                      static_cast<uint16_t>(port)});
     }
 
+    if (data_read_failed) {
+        metrics_.Increment(RpcMetricEvent::DiscoveryRefreshError, 1,
+                           DiscoveryMetricMethod(method_path));
+    }
+
     if (endpoints.empty()) {
+        if (data_read_failed) {
+            *error_msg = "ZooKeeper provider data lookup failed, code=" +
+                         std::to_string(data_error_code);
+            return IsZooKeeperConnectionError(data_error_code)
+                ? mprpc::MprpcErrorCode::NETWORK_ERROR
+                : mprpc::MprpcErrorCode::INTERNAL_ERROR;
+        }
         *error_msg = invalid_address
             ? method_path + " has no valid provider address"
             : method_path + " has no available provider";
@@ -736,7 +815,9 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
     EndpointCacheEntry entry;
     entry.endpoints = std::move(endpoints);
     entry.next_index = 1;
-    entry.expires_at = now + std::chrono::seconds(3);
+    entry.expires_at = std::chrono::steady_clock::now() +
+                       std::chrono::seconds(3);
+    entry.stale = false;
     if (affinity_key.empty()) {
         *endpoint = entry.endpoints.front();
     } else {
@@ -749,6 +830,66 @@ mprpc::MprpcErrorCode ChannelCore::GetEndpoint(const std::string& service_name,
     }
     endpoint_cache_[method_path] = std::move(entry);
     return mprpc::MprpcErrorCode::OK;
+}
+
+void ChannelCore::QueueProviderCacheInvalidation(
+    const std::string& providers_path)
+{
+    if (loop_ == nullptr ||
+        shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::weak_ptr<ChannelCore> weak_self = weak_from_this();
+    loop_->queueInLoop([weak_self, providers_path] {
+        auto self = weak_self.lock();
+        if (!self ||
+            self->shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const std::string suffix = kProvidersSuffix;
+        if (providers_path.size() <= suffix.size() ||
+            providers_path.compare(
+                providers_path.size() - suffix.size(), suffix.size(),
+                suffix) != 0) {
+            return;
+        }
+
+        const std::string method_path = providers_path.substr(
+            0, providers_path.size() - suffix.size());
+        {
+            std::lock_guard<std::mutex> lock(self->discovery_mutex_);
+            const auto it = self->endpoint_cache_.find(method_path);
+            if (it != self->endpoint_cache_.end()) {
+                it->second.stale = true;
+            }
+        }
+        self->metrics_.Increment(
+            RpcMetricEvent::DiscoveryWatchEvent, 1,
+            DiscoveryMetricMethod(method_path));
+    });
+}
+
+void ChannelCore::QueueSessionCacheInvalidation(ZkSessionState)
+{
+    if (loop_ == nullptr ||
+        shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::weak_ptr<ChannelCore> weak_self = weak_from_this();
+    loop_->queueInLoop([weak_self] {
+        auto self = weak_self.lock();
+        if (!self ||
+            self->shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(self->discovery_mutex_);
+        for (auto& entry : self->endpoint_cache_) {
+            entry.second.stale = true;
+        }
+    });
 }
 
 void ChannelCore::InvalidateEndpoint(const std::string& endpoint_key)
