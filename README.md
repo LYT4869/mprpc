@@ -93,8 +93,17 @@ Provider 使用持久目录和临时顺序实例节点：
 
 ChannelCore 维护持久 ZooKeeper 会话、3 秒 endpoint 缓存和轮询索引。无状态 RPC
 按轮询选择；文件客户端预生成 transfer ID，并通过 `affinity_key` 稳定哈希到同一
-Provider，避免本地 Session 被跨节点拆散。TCP 断线或 ZK 连接丢失会使相关缓存
-失效；临时节点让 Provider 异常退出后自动下线。
+Provider，避免本地 Session 被跨节点拆散。
+
+客户端通过 `zoo_wget_children` 在读取 Provider 列表的同时注册一次性 Child Watch。
+节点增删事件只把对应方法缓存标记为 stale，并通过弱引用投递到 Core 固定的 Muduo
+EventLoop；watcher 线程不读取 ZooKeeper，也不直接持有 Core。下一次 RPC 重新读取完整
+列表并重新注册 watch。会话断开、过期和重连会让全部缓存失效，防止继续使用 watch 状态
+不确定的结果。
+
+服务发现保留三条独立纠正路径：Child Watch 提供低延迟通知，3 秒 TTL 修复丢失通知，
+TCP 连接失败淘汰数据面已证实失效的 endpoint。临时节点让 Provider 会话过期后自动
+下线；watch 是刷新提示而不是可靠事件日志。
 
 ## File Upload
 
@@ -146,8 +155,8 @@ Provider 默认使用 4 个业务 worker、最多 64 个 outstanding。Muduo IO 
 
 ChannelCore、RpcProvider 和文件服务分别持有自己的线程安全指标对象，不依赖全局可变
 单例。指标包括 active、成功、超时、取消、网络/框架错误、deadline、过载拒绝、重试、
-CRC 失败、有效字节数以及固定桶延迟直方图。支持总量和按已注册服务方法汇总，不使用
-request ID、transfer ID 或文件名等高基数标签。
+CRC 失败、有效字节数、服务发现 watch/refresh/error 以及固定桶延迟直方图。支持总量
+和按已注册服务方法汇总，不使用 request ID、transfer ID 或文件名等高基数标签。
 
 文件 Provider 默认每 10 秒输出一行 `key=value` 快照，配置
 `metricsintervalms=0` 可禁用。快照由多个原子字段独立读取，是近似瞬时视图，不承诺
@@ -205,6 +214,7 @@ zookeeperport=2181
 ctest --test-dir build --output-on-failure
 ./test/integration/run_rpc_reliability.sh
 ./test/integration/run_file_transfer_e2e.sh
+./test/integration/run_zookeeper_watch.sh
 ```
 
 RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟到响应竞争、取消和 Channel
@@ -212,6 +222,10 @@ RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟�
 上传、强制中断、进程重启恢复和 SHA-256 对比。
 它还会在滑动窗口传输期间重启 Provider，验证连接类错误重试、重复分片幂等和自动
 续传。测试产物保留在脚本输出的临时目录，便于排错。
+
+ZooKeeper Watch 脚本先验证 one-shot child watch 必须显式重新注册，再用一个持久 Channel
+依次加入、删除和重启第二个 Provider，要求每次都在 3 秒 TTL 前观察到成员变化，并检查
+watch、refresh 和 active-call 指标。
 
 ## Benchmark
 

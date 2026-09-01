@@ -88,7 +88,9 @@
     临时节点随会话消失，顺序节点允许同一方法注册多个实例且名字不冲突。
 
 16. **endpoint 缓存的取舍是什么？**
-    缓存减少每次 RPC 的 ZK 开销，但会短暂陈旧；项目用短 TTL，并在 TCP/ZK 断线时主动失效。
+    缓存减少每次 RPC 的 ZK 开销，但会短暂陈旧；项目用 Child Watch 懒失效，并保留短 TTL、TCP 失败和 ZK 会话事件作为兜底。
+
+    ZooKeeper 的传统 watch 是一次性的，所以每次重新读取 Provider 列表时都要重新注册；watch 回调只投递缓存失效任务，不在 ZK 线程中同步读取。
 
     文件上传额外用 transfer ID 做一致的 endpoint affinity；否则普通轮询会把有状态分片发到不同 Provider。
 

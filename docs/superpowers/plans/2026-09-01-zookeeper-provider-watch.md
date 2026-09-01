@@ -35,17 +35,17 @@
 - Produces: `SetChildrenChangedCallback(ChildrenChangedCallback)`
 - Produces: `SetSessionStateCallback(SessionStateCallback)`
 
-- [ ] **Step 1: Write the failing real-ZooKeeper child-watch test**
+- [x] **Step 1: Write the failing real-ZooKeeper child-watch test**
 
 Create a test that starts two `ZkClient` sessions, watches an empty unique providers path, creates one ephemeral sequential child, waits at most one second for the exact path, re-arms the watch, creates a second child, and requires a second callback.
 
-- [ ] **Step 2: Build to verify the new API is missing**
+- [x] **Step 2: Build to verify the new API is missing**
 
 Run: `cmake --build build -j2 --target zk_child_watch_test`
 
 Expected: compilation fails because callback setters and `GetChildrenAndWatch()` do not exist.
 
-- [ ] **Step 3: Implement result types and callback storage**
+- [x] **Step 3: Implement result types and callback storage**
 
 Add:
 
@@ -67,17 +67,17 @@ enum class ZkSessionState { Connected, Disconnected, Expired };
 
 Store callbacks under `mutex_`, copy them while locked, and invoke them after unlocking. Clear callbacks before `zookeeper_close()`.
 
-- [ ] **Step 4: Implement watched and status-aware reads**
+- [x] **Step 4: Implement watched and status-aware reads**
 
 Use `zoo_wget_children(handle, path, &ZkClient::ChildWatcher, this, &values)` and return the raw ZooKeeper code. Keep existing `GetChildren()` and `GetData()` as compatibility wrappers.
 
-- [ ] **Step 5: Run the real watcher test**
+- [x] **Step 5: Run the real watcher test**
 
 Run: `test/integration/run_zookeeper_watch.sh --zk-only`
 
 Expected: two callbacks arrive on the exact providers path and the test prints `PASS`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/include/zookeeperutil.h src/zookeeperutil.cc test/CMakeLists.txt test/integration/zk_child_watch_test.cc test/integration/run_zookeeper_watch.sh
@@ -95,27 +95,27 @@ git commit -m "feat: add ZooKeeper provider child watches"
 - Produces: `RpcMetricEvent::{DiscoveryWatchEvent, DiscoveryRefresh, DiscoveryRefreshError}`
 - Produces snapshot fields `discovery_watch_event`, `discovery_refresh`, and `discovery_refresh_error`
 
-- [ ] **Step 1: Extend the metrics test first**
+- [x] **Step 1: Extend the metrics test first**
 
 Increment all three discovery events for `FriendServiceRpc/GetFriendList`, then assert total and method snapshots contain the same amounts and formatted output contains each key.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `cmake --build build -j2 --target rpcmetrics_test`
 
 Expected: compilation fails on the missing enum members and fields.
 
-- [ ] **Step 3: Implement counters, snapshots, and formatting**
+- [x] **Step 3: Implement counters, snapshots, and formatting**
 
 Add the three atomics to `Counters`, wire every enum into the exhaustive switch, load them in `SnapshotCounters()`, and append them in `AppendValues()`.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run: `build/bin/rpcmetrics_test`
 
 Expected: `PASS` with no assertion failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/include/rpcmetrics.h src/rpcmetrics.cc test/rpcmetrics_test.cpp
@@ -134,33 +134,33 @@ git commit -m "feat: add service discovery metrics"
 - Produces: `QueueProviderCacheInvalidation(const std::string&)`
 - Produces: `QueueSessionCacheInvalidation(ZkSessionState)`
 
-- [ ] **Step 1: Make stale state observable through the E2E test build**
+- [x] **Step 1: Make stale state observable through the E2E test build**
 
 Add the dynamic discovery executable from Task 4 to CMake before changing production behavior. It must fail its runtime expectation with the old TTL-only implementation.
 
-- [ ] **Step 2: Add `stale` to each cache entry**
+- [x] **Step 2: Add `stale` to each cache entry**
 
 Cache hits require a connected ZooKeeper session, `stale == false`, a future expiry, and at least one endpoint.
 
-- [ ] **Step 3: Install callbacks once when creating `ZkClient`**
+- [x] **Step 3: Install callbacks once when creating `ZkClient`**
 
 Capture `weak_from_this()`. The ZooKeeper callback calls `loop_->queueInLoop()`, whose task locks the weak pointer again, checks `shutting_down_`, then marks one method or all methods stale.
 
-- [ ] **Step 4: Replace discovery reads with watched, status-aware reads**
+- [x] **Step 4: Replace discovery reads with watched, status-aware reads**
 
 Map successful empty lists and `ZNONODE` to `SERVICE_NOT_FOUND`; map session/connection failures to `NETWORK_ERROR`; skip children that disappear with `ZNONODE`; report malformed successful data as `INVALID_ADDRESS` only when no valid endpoint remains.
 
-- [ ] **Step 5: Record discovery metrics**
+- [x] **Step 5: Record discovery metrics**
 
 Count valid watch invalidations, successful watched refreshes, and failed refreshes using the existing bounded `service/method` label.
 
-- [ ] **Step 6: Build and run unit regressions**
+- [x] **Step 6: Build and run unit regressions**
 
 Run: `cmake --build build -j2 && ctest --test-dir build --output-on-failure`
 
 Expected: all CTest tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/include/channelcore.h src/channelcore.cc
@@ -179,31 +179,31 @@ git commit -m "feat: invalidate discovery cache from ZooKeeper watches"
 - Consumes: a persistent `MprpcChannel` and `GetMetricsSnapshot()`
 - Produces: one script covering raw watch delivery and full RPC membership changes
 
-- [ ] **Step 1: Create an identity Provider fixture**
+- [x] **Step 1: Create an identity Provider fixture**
 
 Implement `FriendServiceRpc::GetFriendList()` so its response contains its configured listening port. The same binary can therefore represent Provider A and B.
 
-- [ ] **Step 2: Create a persistent-channel client fixture**
+- [x] **Step 2: Create a persistent-channel client fixture**
 
 Warm Provider A, coordinate phases through marker files, observe B before the three-second TTL, converge to A after B stops, then observe restarted B again. Require at least three watch events, successful refreshes, and zero active calls.
 
-- [ ] **Step 3: Write the orchestration script**
+- [x] **Step 3: Write the orchestration script**
 
 Start or reuse local ZooKeeper, clean `/FriendServiceRpc`, start A on `18891`, start the client, add B on `18892`, remove B, restart B, and enforce per-phase timeouts. Always terminate child processes in `trap cleanup EXIT`.
 
-- [ ] **Step 4: Run the E2E test**
+- [x] **Step 4: Run the E2E test**
 
 Run: `test/integration/run_zookeeper_watch.sh`
 
 Expected: raw watch test and dynamic discovery test both print `PASS`; B is selected before TTL expiry on both registrations.
 
-- [ ] **Step 5: Run lifetime verification under sanitizers**
+- [x] **Step 5: Run lifetime verification under sanitizers**
 
-Run: `cmake --build build-asan -j2 && ctest --test-dir build-asan --output-on-failure`
+Run: `cmake --build build-sanitize -j2 && ctest --test-dir build-sanitize --output-on-failure`
 
 Expected: all tests pass with no ASan/UBSan reports.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add test/CMakeLists.txt test/integration/discovery_provider.cc test/integration/discovery_watch_test.cc test/integration/run_zookeeper_watch.sh
@@ -220,11 +220,11 @@ git commit -m "test: cover dynamic ZooKeeper provider discovery"
 - Consumes: completed implementation and measured test behavior
 - Produces: build/run instructions and an interview-ready explanation of one-shot watch + TTL + TCP fallback
 
-- [ ] **Step 1: Document the discovery correction loop**
+- [x] **Step 1: Document the discovery correction loop**
 
 Add the Provider znode layout, one-shot re-registration rule, callback-thread handoff, cache invalidation behavior, three fallbacks, and exact integration command.
 
-- [ ] **Step 2: Run full regression**
+- [x] **Step 2: Run full regression**
 
 Run:
 
@@ -237,7 +237,7 @@ test/integration/run_zookeeper_watch.sh
 
 Expected: every command exits zero.
 
-- [ ] **Step 3: Verify the diff and commit**
+- [x] **Step 3: Verify the diff and commit**
 
 ```bash
 git diff --check
