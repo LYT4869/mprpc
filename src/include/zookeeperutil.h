@@ -2,6 +2,7 @@
 
 #include <zookeeper/zookeeper.h>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -60,6 +61,8 @@ public:
     void SetChildrenChangedCallback(ChildrenChangedCallback callback);
     void SetSessionStateCallback(SessionStateCallback callback);
     bool IsConnected() const;
+    // 每创建一个新的 ZooKeeper 会话句柄，本地代数递增一次。
+    uint64_t SessionGeneration() const;
 private:
     static void GlobalWatcher(zhandle_t* zh, int type, int state,
                               const char* path, void* watcher_context);
@@ -72,6 +75,7 @@ private:
     std::condition_variable connected_cv_;
     bool connected_ = false;
     bool expired_ = false;
+    uint64_t session_generation_ = 0;
     ChildrenChangedCallback children_changed_callback_;
     SessionStateCallback session_state_callback_;
 };

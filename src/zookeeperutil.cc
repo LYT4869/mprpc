@@ -103,6 +103,7 @@ bool ZkClient::Start()
             std::cerr << "zookeeper_init failed" << std::endl;
             return false;
         }
+        ++session_generation_;
         expired_ = false;
     }
 
@@ -198,6 +199,12 @@ bool ZkClient::IsConnected() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return connected_;
+}
+
+uint64_t ZkClient::SessionGeneration() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return session_generation_;
 }
 
 ZkChildrenResult ZkClient::GetChildrenAndWatch(

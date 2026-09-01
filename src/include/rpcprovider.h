@@ -2,6 +2,7 @@
 #include <google/protobuf/service.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <muduo/net/TcpServer.h>
@@ -14,6 +15,8 @@
 #include <google/protobuf/descriptor.h>
 #include <unordered_map>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 #include <cstddef>
 #include "boundedexecutor.h"
@@ -30,6 +33,7 @@ public:
     RpcProvider(std::size_t business_threads,
                 std::size_t max_business_outstanding,
                 int io_threads);
+    ~RpcProvider();
     // 注册一个 Protobuf Service 及其全部方法描述符。
     void NotifyService(google::protobuf::Service *service);
 
@@ -88,6 +92,26 @@ private:
     RpcMetrics metrics_;
     BoundedExecutor business_executor_;
     int io_thread_count_ = 4;
+
+    struct RegistrationControl
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool stop = false;
+        bool requested = false;
+    };
+
+    std::unique_ptr<ZkClient> zk_client_;
+    std::shared_ptr<RegistrationControl> registration_control_;
+    std::thread registration_thread_;
+    std::string provider_endpoint_;
+    uint64_t registered_session_generation_ = 0;
+    std::unordered_set<std::string> registered_method_paths_;
+
+    bool RegisterServicesWithZooKeeper();
+    void RegistrationLoop();
+    void StopRegistrationController();
+
     // 处理连接状态变化。
     void OnConnection(const muduo::net::TcpConnectionPtr&);
 

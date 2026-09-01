@@ -48,6 +48,109 @@ RpcProvider::RpcProvider(std::size_t business_threads,
 {
 }
 
+RpcProvider::~RpcProvider()
+{
+    StopRegistrationController();
+}
+
+bool RpcProvider::RegisterServicesWithZooKeeper()
+{
+    if (!zk_client_ || !zk_client_->Start()) {
+        return false;
+    }
+
+    const uint64_t session_generation =
+        zk_client_->SessionGeneration();
+    if (session_generation != registered_session_generation_) {
+        registered_session_generation_ = session_generation;
+        registered_method_paths_.clear();
+    }
+
+    for (const auto& service : m_serviceMap) {
+        const std::string service_path = "/" + service.first;
+        zk_client_->Create(service_path.c_str(), nullptr, 0);
+        for (const auto& method : service.second.m_methodMap) {
+            const std::string method_path =
+                service_path + "/" + method.first;
+            const std::string providers_path =
+                method_path + "/providers";
+            zk_client_->Create(method_path.c_str(), nullptr, 0);
+            zk_client_->Create(providers_path.c_str(), nullptr, 0);
+            if (registered_method_paths_.count(method_path) != 0) {
+                continue;
+            }
+            if (zk_client_->CreateEphemeralSequential(
+                    providers_path + "/provider-",
+                    provider_endpoint_).empty()) {
+                return false;
+            }
+            registered_method_paths_.insert(method_path);
+        }
+    }
+    return true;
+}
+
+void RpcProvider::RegistrationLoop()
+{
+    const auto control = registration_control_;
+    if (!control) {
+        return;
+    }
+
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(control->mutex);
+            control->cv.wait(lock, [&] {
+                return control->stop || control->requested;
+            });
+            if (control->stop) {
+                return;
+            }
+            control->requested = false;
+        }
+
+        std::cout << "ZooKeeper session expired; scheduling provider "
+                     "re-registration"
+                  << std::endl;
+        std::chrono::milliseconds retry_delay(100);
+        while (!RegisterServicesWithZooKeeper()) {
+            std::unique_lock<std::mutex> lock(control->mutex);
+            if (control->cv.wait_for(lock, retry_delay, [&] {
+                    return control->stop;
+                })) {
+                return;
+            }
+            retry_delay = std::min(
+                retry_delay * 2, std::chrono::milliseconds(3000));
+        }
+        std::cout << "Provider ZooKeeper registration restored"
+                  << std::endl;
+    }
+}
+
+void RpcProvider::StopRegistrationController()
+{
+    if (zk_client_) {
+        zk_client_->SetSessionStateCallback({});
+    }
+
+    const auto control = registration_control_;
+    if (control) {
+        {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            control->stop = true;
+        }
+        control->cv.notify_all();
+    }
+    if (registration_thread_.joinable()) {
+        registration_thread_.join();
+    }
+    zk_client_.reset();
+    registration_control_.reset();
+    registered_method_paths_.clear();
+    registered_session_generation_ = 0;
+}
+
 std::size_t RpcProvider::ActiveCallKeyHash::operator()(
     const ActiveCallKey& key) const noexcept
 {
@@ -114,33 +217,42 @@ void RpcProvider::Run(){
 
     // 把当前rpc节点上要发布的服务全部注册到zk上面，让rpc client可以从zk上发现服务
     // session timeout 30s   zkclient API 网络IO线程 1/3 * timeout 时间发送ping消息（心跳消息）   
-    ZkClient zkCli;
-    if (!zkCli.Start()) {
-        std::cerr << "failed to connect to ZooKeeper" << std::endl;
-        return;
-    }
-    const std::string endpoint = ip + ":" + std::to_string(port);
-    for(auto &sp : m_serviceMap){
-        std::string service_path = "/" + sp.first;
-        zkCli.Create(service_path.data(), nullptr,0, 0);
-        for(auto &mp: sp.second.m_methodMap){
-            std::string method_path = service_path + "/" + mp.first;
-            zkCli.Create(method_path.data(), nullptr, 0, 0);
-            std::string providers_path = method_path + "/providers";
-            zkCli.Create(providers_path.data(), nullptr, 0, 0);
-            const std::string provider_path =
-                zkCli.CreateEphemeralSequential(
-                    providers_path + "/provider-", endpoint);
-            if (provider_path.empty()) {
-                std::cerr << "failed to register " << method_path << std::endl;
+    provider_endpoint_ = ip + ":" + std::to_string(port);
+    registration_control_ = std::make_shared<RegistrationControl>();
+    zk_client_ = std::make_unique<ZkClient>();
+    std::weak_ptr<RegistrationControl> weak_control =
+        registration_control_;
+    zk_client_->SetSessionStateCallback(
+        [weak_control](ZkSessionState state) {
+            if (state != ZkSessionState::Expired) {
                 return;
             }
-        }
+            const auto control = weak_control.lock();
+            if (!control) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(control->mutex);
+                if (control->stop) {
+                    return;
+                }
+                control->requested = true;
+            }
+            control->cv.notify_one();
+        });
+
+    if (!RegisterServicesWithZooKeeper()) {
+        std::cerr << "failed to connect to ZooKeeper" << std::endl;
+        StopRegistrationController();
+        return;
     }
+    registration_thread_ =
+        std::thread(&RpcProvider::RegistrationLoop, this);
     std::cout << "[RpcProvider] start service at ip: " << ip << " port: " << port << std::endl;
     // 启动网络服务
     server.start();
     m_eventLoop.loop();
+    StopRegistrationController();
 }
 
 void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn){

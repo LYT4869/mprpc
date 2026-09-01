@@ -59,6 +59,13 @@ add_executable(discovery_watch_test
 )
 target_link_libraries(discovery_watch_test PRIVATE mprpc protobuf pthread)
 
+add_executable(provider_reregistration_test
+    integration/provider_reregistration_test.cc
+    ${PROJECT_SOURCE_DIR}/example/friend.pb.cc
+)
+target_link_libraries(provider_reregistration_test
+    PRIVATE mprpc protobuf pthread)
+
 if(BUILD_TESTING)
     add_test(NAME codec_test COMMAND codec_test)
     add_test(NAME rpcmetrics_test COMMAND rpcmetrics_test)

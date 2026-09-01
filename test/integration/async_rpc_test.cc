@@ -168,7 +168,8 @@ bool TestAsyncTimeout(fixbug::FriendServiceRpc_Stub* stub){
 
     bool timeout_reported = 
         context->controller.Failed() &&
-        context->controller.ErrorText().find("timeout") != std::string::npos;
+        context->controller.ErrorCode() ==
+            mprpc::MprpcErrorCode::TIMEOUT;
 
     lock.unlock();
 
