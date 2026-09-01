@@ -24,6 +24,9 @@ struct RpcMetrics::Counters
     std::atomic<uint64_t> session_conflict{0};
     std::atomic<uint64_t> duplicate_chunk{0};
     std::atomic<uint64_t> bytes_transferred{0};
+    std::atomic<uint64_t> discovery_watch_event{0};
+    std::atomic<uint64_t> discovery_refresh{0};
+    std::atomic<uint64_t> discovery_refresh_error{0};
     std::array<std::atomic<uint64_t>, 11> latency_buckets{};
 };
 
@@ -108,6 +111,12 @@ void Increment(RpcMetrics::Counters* counters,
         target = &counters->duplicate_chunk; break;
     case RpcMetricEvent::BytesTransferred:
         target = &counters->bytes_transferred; break;
+    case RpcMetricEvent::DiscoveryWatchEvent:
+        target = &counters->discovery_watch_event; break;
+    case RpcMetricEvent::DiscoveryRefresh:
+        target = &counters->discovery_refresh; break;
+    case RpcMetricEvent::DiscoveryRefreshError:
+        target = &counters->discovery_refresh_error; break;
     }
     target->fetch_add(amount, std::memory_order_relaxed);
 }
@@ -136,6 +145,9 @@ RpcMetricValues SnapshotCounters(const RpcMetrics::Counters& counters)
     LOAD_COUNTER(session_conflict);
     LOAD_COUNTER(duplicate_chunk);
     LOAD_COUNTER(bytes_transferred);
+    LOAD_COUNTER(discovery_watch_event);
+    LOAD_COUNTER(discovery_refresh);
+    LOAD_COUNTER(discovery_refresh_error);
 #undef LOAD_COUNTER
     for (std::size_t i = 0; i < values.latency_buckets.size(); ++i) {
         values.latency_buckets[i] =
@@ -165,7 +177,12 @@ void AppendValues(std::ostringstream& output,
            << " crc_failure=" << values.crc_failure
            << " session_conflict=" << values.session_conflict
            << " duplicate_chunk=" << values.duplicate_chunk
-           << " bytes_transferred=" << values.bytes_transferred;
+           << " bytes_transferred=" << values.bytes_transferred
+           << " discovery_watch_event="
+           << values.discovery_watch_event
+           << " discovery_refresh=" << values.discovery_refresh
+           << " discovery_refresh_error="
+           << values.discovery_refresh_error;
 }
 } // namespace
 

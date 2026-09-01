@@ -33,6 +33,14 @@ int main()
     }
     for (auto& worker : workers) worker.join();
 
+    const std::string discovery_method = "FriendServiceRpc/GetFriendList";
+    metrics.Increment(RpcMetricEvent::DiscoveryWatchEvent, 2,
+                      discovery_method);
+    metrics.Increment(RpcMetricEvent::DiscoveryRefresh, 3,
+                      discovery_method);
+    metrics.Increment(RpcMetricEvent::DiscoveryRefreshError, 1,
+                      discovery_method);
+
     const RpcMetricsSnapshot snapshot = metrics.Snapshot();
     const uint64_t expected = kThreads * kCallsPerThread;
     assert(snapshot.total.started == expected);
@@ -41,12 +49,25 @@ int main()
     assert(snapshot.total.timeout == expected / 10);
     assert(snapshot.total.bytes_transferred == expected * 64);
     assert(snapshot.total.latency_buckets.back() == expected);
-    assert(snapshot.methods.size() == 2);
+    assert(snapshot.total.discovery_watch_event == 2);
+    assert(snapshot.total.discovery_refresh == 3);
+    assert(snapshot.total.discovery_refresh_error == 1);
+    assert(snapshot.methods.size() == 3);
+    const auto discovery = snapshot.methods.find(discovery_method);
+    assert(discovery != snapshot.methods.end());
+    assert(discovery->second.discovery_watch_event == 2);
+    assert(discovery->second.discovery_refresh == 3);
+    assert(discovery->second.discovery_refresh_error == 1);
 
     const std::string formatted =
         FormatRpcMetrics("test", snapshot);
     assert(formatted.find("component=test") != std::string::npos);
     assert(formatted.find("active=0") != std::string::npos);
+    assert(formatted.find("discovery_watch_event=2") !=
+           std::string::npos);
+    assert(formatted.find("discovery_refresh=3") != std::string::npos);
+    assert(formatted.find("discovery_refresh_error=1") !=
+           std::string::npos);
 
     std::atomic<int> reports{0};
     std::ostringstream output;

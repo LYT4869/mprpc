@@ -38,6 +38,9 @@ struct RpcMetricValues
     uint64_t session_conflict = 0;
     uint64_t duplicate_chunk = 0;
     uint64_t bytes_transferred = 0;
+    uint64_t discovery_watch_event = 0;
+    uint64_t discovery_refresh = 0;
+    uint64_t discovery_refresh_error = 0;
     std::array<uint64_t, 11> latency_buckets{};
 };
 
@@ -61,6 +64,9 @@ enum class RpcMetricEvent
     SessionConflict,
     DuplicateChunk,
     BytesTransferred,
+    DiscoveryWatchEvent,
+    DiscoveryRefresh,
+    DiscoveryRefreshError,
 };
 
 // Component-owned lock-light counters with bounded method labels.
