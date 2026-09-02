@@ -221,6 +221,7 @@ ctest --test-dir build --output-on-failure
 ./test/integration/run_file_transfer_e2e.sh
 ./test/integration/run_zookeeper_watch.sh
 ./test/integration/run_provider_reregistration.sh
+./test/integration/run_large_file_e2e.sh
 ```
 
 RPC 可靠性脚本覆盖异步立即返回、乱序并发响应、超时与迟到响应竞争、取消和 Channel
@@ -236,6 +237,12 @@ watch、refresh 和 active-call 指标。
 Provider 重注册脚本使用独立 ZooKeeper 实例：先验证短暂断线不会产生重复节点，再强制旧
 Session 失效，确认不重启 Provider 进程即可恢复注册，并由全新客户端完成 RPC 调用。
 
+大型文件脚本使用独立 ZooKeeper 和 Provider，依次上传 256 MiB 与 1 GiB 文件，并用外部
+`sha256sum` 比较源文件和服务端最终文件；成功后自动清理大文件，失败时保留现场。
+
+当前提交的 Debug、Sanitizer、集成测试、Release 压测和 256 MiB/1 GiB 校验结果汇总见
+[2026-09-02 测试基线](docs/test-results-2026-09-02.md)。
+
 ## Benchmark
 
 ```bash
@@ -245,15 +252,15 @@ Session 失效，确认不重启 Provider 进程即可恢复注册，并由全�
 ```
 
 脚本使用独立 `build-release`，正式计时前会让每个 uploader 分别完成 3 次预热，并
-采集客户端/Provider 的 `/proc` CPU 与 RSS。2026-08-24 的本机 WSL2 回环结果中，16 MiB 单上传从窗口 1 的
-43.46 MiB/s 增长到窗口 8 的 52.07 MiB/s，窗口 16 回落至 49.47 MiB/s 且峰值 RSS
-继续上升。1 MiB 延迟组每个并发档有 100 个成功样本；并发 8 的 P99 上升到
-248.74 ms。64 MiB 饱和组在并发 8 出现 4 次快速 `SERVER_BUSY`，说明系统到达有界
-队列保护点。
+采集客户端/Provider 的 `/proc` CPU 与 RSS。2026-09-02 的本机 WSL2 回环结果中，1 MiB
+延迟组从并发 1 到 8 的有效吞吐由 28.27 提升到 72.95 MiB/s，但 P99 由 67.27 上升到
+193.27 ms。16 MiB 单上传在窗口 8 达到本轮最高的 61.14 MiB/s，窗口 16 为 59.71 MiB/s。
+64 MiB 饱和组在并发 8 时有 14/16 次请求被快速 `SERVER_BUSY` 拒绝，说明系统到达有界
+队列保护点；该组吞吐只统计成功完成的文件。
 
 环境、命令、解释和原始 CSV 见
-[`docs/release-benchmark-2026-08-24.md`](docs/release-benchmark-2026-08-24.md)。这些结果
-用于选择窗口和分析容量边界，不代表生产网络或磁盘性能。
+[`docs/test-results-2026-09-02.md`](docs/test-results-2026-09-02.md)。这些结果用于选择窗口
+和分析容量边界，不代表生产网络或磁盘性能。旧报告保留为历史对照。
 
 ## Scope
 

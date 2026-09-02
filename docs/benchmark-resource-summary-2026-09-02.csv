@@ -1,0 +1,5 @@
+profile,client_peak_rss_kib,provider_peak_rss_kib,provider_cpu_seconds
+latency,62436,62776,3.04
+window,40692,60892,7.04
+saturation,249256,128340,42.98
+large-files,25380,56384,7.02

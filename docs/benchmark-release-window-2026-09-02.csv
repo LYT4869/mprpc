@@ -1,0 +1,6 @@
+size_mib,window,concurrency,samples,warmup_per_uploader,connection_mode,success,failed,successful_goodput_mib_s,p50_ms,p95_ms,p99_ms,percentiles_valid,retries,retry_exhausted,chunk_attempts,duplicate_chunks,queue_rejected,max_in_flight,rpc_started,rpc_timeout,rpc_network_error,rpc_cancelled,callback_rejected,rpc_active_end,cpu_seconds,rss_kib,peak_rss_kib
+16,1,1,10,3,warm,10,0,44.47,347.52,425.26,425.26,0,0,0,160,0,0,1,190,0,0,0,0,0,0.88,16628,19716
+16,2,1,10,3,warm,10,0,54.51,268.62,420.40,420.40,0,0,0,160,0,0,2,190,0,0,0,0,0,0.70,19764,22836
+16,4,1,10,3,warm,10,0,52.29,299.33,349.91,349.91,0,0,0,160,0,0,4,190,0,0,0,0,0,0.87,20668,27708
+16,8,1,10,3,warm,10,0,61.14,257.51,324.69,324.69,0,0,0,160,0,0,8,190,0,0,0,0,0,0.86,20608,30740
+16,16,1,10,3,warm,10,0,59.71,264.44,381.97,381.97,0,0,0,160,0,0,14,190,0,0,0,0,0,0.82,24616,40692
