@@ -191,7 +191,7 @@ std::vector<BenchmarkConfig> BuildProfile(const CommandLine& command)
         }
     } else if (command.profile == "saturation") {
         for (uint32_t concurrency : {1U, 2U, 4U, 8U}) {
-            append(64, 8, concurrency, 5, 3, false, true);
+            append(64, 8, concurrency, 16, 3, false, true);
         }
     } else if (command.profile == "custom") {
         append(8, 8, 1, 10, 3, command.samples >= 100);
@@ -435,7 +435,7 @@ bool RunConfiguration(const BenchmarkConfig& config,
         }
     }
 
-    const double throughput = wall_seconds > 0.0
+    const double successful_goodput = wall_seconds > 0.0
         ? static_cast<double>(aggregate.successes * config.size_mib) /
               wall_seconds
         : 0.0;
@@ -445,7 +445,7 @@ bool RunConfiguration(const BenchmarkConfig& config,
         << config.warmup << ','
         << (config.cold_connections ? "cold" : "warm") << ','
         << aggregate.successes << ',' << aggregate.failures << ','
-        << std::fixed << std::setprecision(2) << throughput << ','
+        << std::fixed << std::setprecision(2) << successful_goodput << ','
         << Percentile(aggregate.latencies_ms, 0.50) << ','
         << Percentile(aggregate.latencies_ms, 0.95) << ','
         << Percentile(aggregate.latencies_ms, 0.99) << ','
@@ -499,7 +499,7 @@ int main(int argc, char** argv)
     std::ostream& output = output_file ? output_file : std::cout;
     output << "size_mib,window,concurrency,samples,warmup_per_uploader,"
               "connection_mode,"
-              "success,failed,throughput_mib_s,p50_ms,p95_ms,p99_ms,"
+              "success,failed,successful_goodput_mib_s,p50_ms,p95_ms,p99_ms,"
               "percentiles_valid,retries,retry_exhausted,chunk_attempts,"
               "duplicate_chunks,queue_rejected,max_in_flight,rpc_started,"
               "rpc_timeout,"
