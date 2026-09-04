@@ -262,6 +262,10 @@ Session 失效，确认不重启 Provider 进程即可恢复注册，并由全�
 [`docs/test-results-2026-09-02.md`](docs/test-results-2026-09-02.md)。这些结果用于选择窗口
 和分析容量边界，不代表生产网络或磁盘性能。旧报告保留为历史对照。
 
+补充的 256 MiB 滑动窗口实验见
+[`docs/window-size-comparison-2026-09-04.md`](docs/window-size-comparison-2026-09-04.md)，
+用于对照文件大小变化后窗口 8/16 的吞吐趋势与在途并发差异。
+
 ## Scope
 
 本项目只实现文件上传，不包含下载、认证、TLS、数据库和跨机器共享 Session。多个

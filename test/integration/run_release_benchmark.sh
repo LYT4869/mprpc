@@ -6,6 +6,26 @@ BUILD_DIR=$ROOT_DIR/build-release
 BIN_DIR=$BUILD_DIR/bin
 ZK_HOME=${ZK_HOME:-/home/lyt4869/package/apache-zookeeper-3.8.6-bin}
 PROFILE=${1:-smoke}
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+BENCHMARK_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --size-mib|--window|--concurrency|--samples|--warmup)
+            if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "$1 requires a non-negative integer" >&2
+                exit 1
+            fi
+            BENCHMARK_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        *)
+            echo "unsupported benchmark override: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT_DIR/artifacts/release-benchmark-$PROFILE}
 RUN_ROOT=$(mktemp -d /tmp/mprpc_release_benchmark.XXXXXX)
 CONFIG="$RUN_ROOT/benchmark.conf"
@@ -98,7 +118,8 @@ SERVER_MONITOR_PID=$!
 
 "$BIN_DIR/file_transfer_benchmark" -i "$CONFIG" \
     "$RUN_ROOT/work" --profile "$PROFILE" \
-    --connection-mode warm --output "$OUTPUT_ROOT/results.csv" \
+    --connection-mode warm "${BENCHMARK_ARGS[@]}" \
+    --output "$OUTPUT_ROOT/results.csv" \
     >"$OUTPUT_ROOT/client.log" 2>&1 &
 CLIENT_PID=$!
 sample_process "$CLIENT_PID" "$OUTPUT_ROOT/client-resources.csv" &
